@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# panel-verify - report ONLY what disk evidence proves about this session latest round (req: no hallucinated status).
+# Usage: panel-verify <session> [--round N]   default = latest dispatched round
+# Prints a short machine-checkable verdict. The orchestrator MUST read this before telling the human
+# "the panel is running / dispatched". If it says NOT DISPATCHED or FAILED, say exactly that - do not report as running.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+[ $# -ge 1 ] || die "usage: panel-verify <session> [--round N]"
+d="$(resolve_session "$1")"; shift
+rn=""; while [ $# -gt 0 ]; do case "$1" in --round) rn="$2"; shift 2;; -h|--help) sed -n '3,6p' "$0"; exit 0;; *) die "unknown arg: $1";; esac; done
+
+# latest round that has a round.json (i.e. panel-dispatch got far enough to record it)
+latest_with_round() { local m=0 r f; for f in "$d"/rounds/r*/round.json; do [ -e "$f" ] || continue; r="${f#$d/rounds/}"; r="${r%%/*}"; r="${r#r}"; if [ "$r" -gt "$m" ]; then m="$r"; fi; done; printf '%s' "$m"; }
+[ -n "$rn" ] || rn="$(latest_with_round)"
+
+if [ -z "${rn:-}" ] || [ ! -e "$d/rounds/r$rn/round.json" ]; then
+  if charter_unfilled "$d/charter.md"; then
+    echo "NOT DISPATCHED: charter unfilled. $d/charter.md still contains FILL markers in its CONTENT; HTML comments are ignored, so fill every marker in the text. panel-dispatch refuses before sending any brief."
+    exit 2
+  fi
+  echo "NOT DISPATCHED: no round recorded yet - no rounds/r*/round.json exists. A dispatch was never completed, so do NOT report the panel as running."
+  exit 2
+fi
+
+rd="$d/rounds/r$rn"
+tj="$(jq -r .type "$rd/round.json")"
+declare -A STATE REASON DELIV BRIEF ANS
+n_disp=0; n_queued=0; n_failed=0; n_skipped=0; n_answered=0; total=0
+for mj in "$rd"/meta/*.json; do [ -e "$mj" ] || continue
+  p="$(basename "$mj" .json)"; total=$((total+1))
+  s="$(jq -r '.state // "unknown"' "$mj")"; rsn="$(jq -r '.reason // ""' "$mj")"; dl="$(jq -r 'if has("delivered") then (.delivered|tostring) else "?" end' "$mj")"
+  STATE[$p]="$s"; REASON[$p]="$rsn"; DELIV[$p]="$dl"
+  if [ -s "$rd/dispatch/$p.md" ]; then BRIEF[$p]=yes; else BRIEF[$p]=no; fi
+  if [ -s "$rd/in/$p.md" ]; then ANS[$p]=yes; n_answered=$((n_answered+1)); else ANS[$p]=no; fi
+  case "$s" in dispatched) n_disp=$((n_disp+1));; queued) n_queued=$((n_queued+1));; failed|error) n_failed=$((n_failed+1));; skipped) n_skipped=$((n_skipped+1));; esac
+done
+
+echo "ROUND r$rn type=$tj total=$total dispatched=$n_disp queued=$n_queued answered=$n_answered failed=$n_failed skipped=$n_skipped"
+for p in "${!STATE[@]}"; do printf '  %-24s state=%-9s brief=%-3s answer=%-3s delivered=%s%s\n' "$p" "${STATE[$p]}" "${BRIEF[$p]:-?}" "${ANS[$p]:-?}" "${DELIV[$p]:-?}" "${REASON[$p]:+  reason: ${REASON[$p]}}"; done
+
+if [ "$total" -eq 0 ]; then
+  echo "VERDICT NOT DISPATCHED: round recorded but no per-panel meta; panel-dispatch did not complete. Do NOT report as running."
+  exit 2
+fi
+if [ "$n_disp" -gt 0 ] || [ "$n_queued" -gt 0 ]; then
+  active=$(( n_disp + n_queued ))
+  echo "VERDICT RUNNING, evidence-backed: $active panels dispatched or queued; poll with panel-collect."
+  exit 0
+fi
+if [ "$n_failed" -gt 0 ] && [ "$n_answered" -eq 0 ]; then
+  echo "VERDICT FAILED DISPATCH: no brief reached a working panel. Report the failure using the reasons above; do NOT report as running."
+  exit 3
+fi
+echo "VERDICT NO ACTIVE PANELS this round (all skipped or failed with no answer). Do NOT report as running."
+exit 2

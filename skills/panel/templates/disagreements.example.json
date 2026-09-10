@@ -1,0 +1,45 @@
+{
+  "round_source": 1,
+  "written_by": "orchestrator — conflicts identified, no resolution proposed; every summary is an exact substring of the claim/section its refs point at (D6-A/U19)",
+  "conflicts": [
+    {
+      "id": "D1",
+      "topic": "Whether X should be done before Y",
+      "positions": {
+        "A": {
+          "summary": "X must run first because Y consumes X's output",
+          "held_by": [
+            "codex",
+            "agy"
+          ],
+          "refs": [
+            "rounds/r1/in/codex.md#C2",
+            "rounds/r1/in/agy.md#C4"
+          ]
+        },
+        "B": {
+          "summary": "Y first; X is optional and can be skipped",
+          "held_by": [
+            "hermes"
+          ],
+          "refs": [
+            "rounds/r1/in/hermes.md#C1"
+          ]
+        },
+        "C": {
+          "summary": "Y first (same as B, worded by claude)",
+          "held_by": [
+            "claude"
+          ],
+          "aliases": [
+            "B"
+          ],
+          "refs": [
+            "rounds/r1/in/claude.md#C3"
+          ]
+        }
+      },
+      "note": "Rules panel-dispatch enforces (no bypass): at least TWO positions; every summary a verbatim (whitespace-normalised) substring of the claim or section named by its refs; refs = <panel answer file>#C<n> or #SECTION (VOTES, VERDICT, REASONING, CORRECTIONS, NEW CONFLICTS, …), anchor must exist; `aliases` only for pairs the previous tally listed under `equivalences` (every holder declared them, D9-A) — never invented by the orchestrator. D0 is reserved for the framing vote. Whether two cited claims really contradict is panel-reviewed (D0 framing vote), not machine-proved."
+    }
+  ]
+}

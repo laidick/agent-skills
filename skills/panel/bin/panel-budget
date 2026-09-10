@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# panel-budget — usage-budget gate for subscription panels (provider != local in the manifest).
+# Rule (owner-specified): linear pace. If used% <= (elapsed/window)% + buffer -> dispatch; else skip this round.
+# Sources of used%/reset: (a) reactive — panel-collect classifies a usage-limit banner and stores the reset time;
+# (b) proactive — `panel-budget --probe` sends the provider's usage command (manifest usage.probe), reads the screen,
+# parses "NN% used|left" and "resets …" from output provably produced by that probe (D3-A), stores it. Nothing fresh or
+# unparseable -> nothing written, fail OPEN (dispatch); the pre/post screens are kept under state/probes for tuning.
+# Usage: panel-budget [--probe] [--session <dir>] [label ...]
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+probe=0; sess=""; labels=()
+while [ $# -gt 0 ]; do case "$1" in
+  --probe) probe=1; shift;;
+  --session) sess="$(resolve_session "$2")"; shift 2;;
+  -h|--help) sed -n '2,8p' "$0"; exit 0;;
+  *) labels+=("$1"); shift;;
+esac; done
+[ -f "$PANEL_MANIFEST" ] || die "no manifest at $PANEL_MANIFEST"
+mkdir -p "$PANEL_STATE_DIR/budget" "$PANEL_STATE_DIR/probes"
+[ "${#labels[@]}" -gt 0 ] || mapfile -t labels < <(jq -r '.panels | to_entries[] | select(.value.provider != "local") | .key' "$PANEL_MANIFEST")
+
+printf '%-32s %-14s %-6s %s\n' LABEL PROVIDER GATE REASON
+for label in "${labels[@]}"; do
+  provider="$(manifest_get "$label" '.provider' unknown)"
+  if [ "$probe" = 1 ]; then
+    cmd="$(manifest_get "$label" '.usage.probe' '')"
+    pane="$(pane_by_label "$label")"
+    if [ -n "$cmd" ] && [ -n "$pane" ]; then
+      st="$(agent_status "$pane")"
+      if [ "$st" = idle ] || [ "$st" = done ]; then
+        # D3-A (iteration 6): the pre-command screen is the freshness baseline; probe_parse (panel-lib) accepts only output provably
+        # produced by this probe and re-reads while the screen is unchanged or the provider says its limits may be stale.
+        stamp="$(date +%Y%m%d-%H%M%S)"; pre="$PANEL_STATE_DIR/probes/$label-$stamp.pre.txt"; post="$PANEL_STATE_DIR/probes/$label-$stamp.txt"
+        herdr pane read "$pane" --source visible > "$pre" 2>/dev/null || true
+        herdr agent prompt "$pane" "$cmd" >/dev/null 2>&1 || true
+        pstatus=waiting; used=""; hint=""; flags=""; note=""; tries=0
+        while [ "$tries" -lt "$PANEL_PROBE_RETRIES" ]; do
+          tries=$((tries + 1)); sleep "$PANEL_PROBE_WAIT_S"
+          herdr pane read "$pane" --source visible > "$post" 2>/dev/null || true
+          last=0; [ "$tries" -lt "$PANEL_PROBE_RETRIES" ] || last=1   # on the last read a provider "may be stale" caveat is accepted and noted
+          IFS=$'\x1f' read -r pstatus used hint flags note < <(probe_parse "$cmd" "$(manifest_get "$label" '.usage.window' '')" "$pre" "$post" "$last" "$(manifest_get "$label" '.usage.line' '')")
+          case "$pstatus" in fresh) break;; esac   # D2 (iteration 7): none / waiting / stale all re-read until the read budget is spent
+        done
+        herdr agent send-keys "$pane" esc >/dev/null 2>&1 || true
+        if [ "$pstatus" = fresh ] && [ -n "$used" ]; then
+          reset="$(parse_reset_epoch "$hint")"; dated=0; ! reset_hint_dated "$hint" || dated=1; now="$(now_epoch)"; cav=""
+          case ",$flags," in *,caveat,*) cav="provider: limits may be stale (accepted on read $tries of $PANEL_PROBE_RETRIES)";; esac
+          # D1-B (iteration 7): the probe writer gets panel-collect's stale-echo guard — a reset hint less than 6 h in the past is the echo
+          # of an expired window: write nothing, fail open (the gate falls back to the stored state, which ages out per D7-B). An older
+          # undated past hint is inferred as tomorrow's instance by budget_write; a dated hint is stored as parsed, never day-shifted.
+          if [ -n "$reset" ] && [ "$reset" -lt "$now" ] && [ $((now - reset)) -lt 21600 ]; then
+            [ -n "$sess" ] && transcript "$sess" budget "$label probe '$cmd' → used=${used}% but the reset hint '${hint}' is $(( (now - reset) / 60 )) min in the past: stale echo of an expired window — no budget state written (D1-B)"
+            printf 'panel-budget: %s probe: reset hint "%s" is in the recent past (stale echo) — state not written\n' "$label" "$hint" >&2
+          else
+            pos=0; case ",$flags," in *,positional,*) pos=1;; esac   # D2-B (iteration 8): persisted, so the gate can see it
+            budget_write "$label" probe "$hint" "$reset" "$used" "probe:$cmd" "$dated" "$cav" "$pos"
+            [ -n "$sess" ] && transcript "$sess" budget "$label probe '$cmd' → used=${used}% hint='${hint}'${flags:+ flags=$flags} ($note; read $tries)"
+          fi
+        else
+          # nothing provably fresh → no state written (the gate below fails open; an older state keeps its own age-out, D7-B)
+          [ -n "$sess" ] && transcript "$sess" budget "$label probe '$cmd' → no fresh measurement after $tries read(s): $pstatus${note:+ — $note}; no budget state written (screens: $pre, $post)"
+          printf 'panel-budget: %s probe: no fresh measurement (%s%s) — state not written, gate falls back to the stored state\n' "$label" "$pstatus" "${note:+: $note}" >&2
+        fi
+      else
+        [ -n "$sess" ] && transcript "$sess" budget "$label probe skipped: agent $st"
+      fi
+    fi
+  fi
+  IFS=$'\t' read -r gate reason < <(budget_check "$label")
+  printf '%-32s %-14s %-6s %s\n' "$label" "$provider" "$gate" "$reason"
+done

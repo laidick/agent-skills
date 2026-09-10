@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# panel-heal — bring every manifest panel back to a usable state before a round.
+#   pane missing            -> split a new pane from the orchestrator, label it, start the agent from the manifest
+#   pane present, no agent  -> start the agent from the manifest (fresh, clean session; model/effort/thinking per manifest args)
+#   agent unknown/stalled   -> report (no automatic kill); use --restart <label> to close + recreate + start
+#   agent working/blocked   -> leave alone (never interrupt)
+# Usage: panel-heal [--session <dir>] [--dry-run] [--quiet] [--restart <label>] [--force]
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+sess=""; dry=0; quiet=0; restart=""; force=0
+while [ $# -gt 0 ]; do case "$1" in
+  --session) sess="$(resolve_session "$2")"; shift 2;;
+  --dry-run) dry=1; shift;;
+  --quiet) quiet=1; shift;;
+  --restart) restart="$2"; shift 2;;
+  --force) force=1; shift;;
+  -h|--help) sed -n '2,8p' "$0"; exit 0;;
+  *) die "unknown arg: $1";;
+esac; done
+[ -f "$PANEL_MANIFEST" ] || { [ "$quiet" = 1 ] || warn "no manifest at $PANEL_MANIFEST — nothing to heal (run panel-manifest capture)"; exit 0; }
+log() { [ "$quiet" = 1 ] && [ "${2:-}" != force ] || printf '%s\n' "$1"; [ -n "$sess" ] && transcript "$sess" heal "$1" || true; }
+
+start_agent() { # start_agent <label> <pane>
+  local label="$1" pane="$2" kind name tmo
+  kind="$(manifest_get "$label" '.kind')"; name="$(agent_name_from_label "$label")"
+  mapfile -t argv < <(jq -r --arg l "$label" '.panels[$l].start[1:][]?' "$PANEL_MANIFEST")
+  tmo="$(manifest_get "$label" '.start_timeout_ms' '90000')"
+  if [ "$dry" = 1 ]; then log "DRY  $label: would start kind=$kind name=$name pane=$pane args=[${argv[*]:-}]"; return 0; fi
+  if out="$(herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout "$tmo" ${argv[@]+-- "${argv[@]}"} 2>&1)"; then
+    log "started $label ($kind) in $pane as agent '$name'" force
+  else
+    log "FAILED to start $label in $pane: $(printf '%s' "$out" | jq -r '.error.code // .error.message // empty' 2>/dev/null || printf '%s' "$out" | tail -1)" force
+    return 1
+  fi
+}
+
+while IFS=$'\t' read -r label kind cwd; do
+  pane="$(pane_by_label "$label")"
+  if [ -n "$restart" ] && [ "$restart" = "$label" ] && [ -n "$pane" ]; then
+    st="$(agent_status "$pane")"
+    if { [ "$st" = working ] || [ "$st" = blocked ]; } && [ "$force" = 0 ]; then log "refuse restart $label: agent is $st (use --force)" force; continue; fi
+    if [ "$dry" = 1 ]; then log "DRY  $label: would close $pane and recreate"; continue; fi
+    herdr pane close "$pane" >/dev/null 2>&1 || true; log "closed $pane for restart of $label" force; pane=""
+  fi
+  if [ -z "$pane" ]; then
+    if [ "$dry" = 1 ]; then log "DRY  $label: pane missing — would split in its snapshot grid slot (fallback: down from $HERDR_PANE_ID, cwd $cwd), rename, start $kind"; continue; fi
+    # v1.14.1: recreate in the snapshot GRID SLOT (a down-split from the orchestrator pane lands
+    # ~16-20 rows tall and opencode's TUI core-dumps there); orchestrator split is the LAST resort.
+    new="$(split_pane_for_label "$label" "$cwd")"
+    if [ -n "$new" ] && [ "$new" != null ]; then
+      log "created pane $new for $label in its snapshot grid slot" force
+    else
+      log "WARN  $label: no grid-slot split (no snapshot or no live row neighbor) — falling back to orchestrator down-split (pane may be too small; run panel-restore --force for exact geometry)" force
+      new="$(herdr pane split --pane "$HERDR_PANE_ID" --direction down --cwd "$cwd" --no-focus | jq -r '.result.pane.pane_id')"
+    fi
+    [ -n "$new" ] && [ "$new" != null ] || { log "FAILED to split a pane for $label" force; continue; }
+    herdr pane rename "$new" "$label" >/dev/null
+    log "pane $new labeled $label" force
+    sleep 1
+    start_agent "$label" "$new" || true
+    continue
+  fi
+  st="$(agent_status "$pane")"
+  case "$st" in
+    none)
+      fg="$(herdr pane process-info --pane "$pane" 2>/dev/null | jq -r '.result.process_info.foreground_processes | length')"
+      if [ "${fg:-0}" -gt 0 ]; then log "$label ($pane): no agent but a foreground process is running — not touching it (use --restart $label)" force; continue; fi
+      start_agent "$label" "$pane" || true ;;
+    unknown) log "$label ($pane): agent state unknown — left alone; if stalled: panel-heal --restart $label" force ;;
+    working|blocked) log "$label ($pane): $st — untouched" ;;
+    idle|done) log "$label ($pane): ok ($st)" ;;
+    gone) log "$label: pane $pane vanished mid-check" force ;;
+  esac
+done < <(jq -r '.panels | to_entries[] | [.key, .value.kind, .value.cwd] | @tsv' "$PANEL_MANIFEST")

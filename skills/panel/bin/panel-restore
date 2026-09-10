@@ -1,0 +1,256 @@
+#!/usr/bin/env bash
+# panel-restore — rebuild the panel grid after pane loss, preserving LAYOUT POSITIONS (owner rule
+# 2026-09-09: 8 panels, 4 above / 4 below, same workspace/tab as the orchestrator column).
+#
+# EMPIRICAL herdr semantics (verified live 2026-09-09, THREE full kill+rebuild rounds):
+#   * `pane split --pane P --direction right --ratio R`: P KEEPS R of the width; the NEW pane
+#     gets the remaining 1-R, placed right of P. Same for down (P keeps R of the height, new pane
+#     below). To give P exactly W of a container C: R = W/C.
+#   * Closing panes collapses the split tree into the surviving neighbor. After a full grid kill
+#     the tab degenerates to stacked full-width bands (one per surviving non-panel pane).
+#   * A pane can be walked one neighbor at a time with `pane swap --direction <d>`; the terminal
+#     follows the pane. Walking the orchestrator pane into the left column: up, left, left
+#     (from the bottom band), then the displaced leftover is closed to stretch the grid.
+#   * The final `close` of the leftover full-width band is what stretches the grid rows to full
+#     height — while it exists, every row in the top band is half height.
+#
+# RECIPE (each step verified against live rects):
+#   state: pC(top band, full width) / me(pK, bottom band)  [after the kill]
+#   1. anchor=pC  split RIGHT  R=left_w/tab_w          -> grid area (right of the column)
+#   2. anchor    split DOWN   R=top_h/tab_h           -> spare left slot (the column partner)
+#   3. grid      split DOWN   R=0.5                   -> top row | bottom row
+#   4. per row: 3 RIGHT splits, each ratio = col_width_i / remaining_width_i (snapshot columns)
+#   5. walk the orchestrator pane (me) into the spare left slot: swap up, left, left
+#      (the walk is relative — the script computes directions from live rects each step)
+#   6. swap the leftover band pane UP into the last grid slot it can reach, then the displaced
+#      pane becomes the leftover; close it -> grid rows stretch to full height
+#   7. rename the 8 grid panes (snapshot order: y then x), start agents from start[] (rule 24)
+#   8. verify every rect against the snapshot; non-zero exit on any diff
+#
+# Usage: panel-restore [--dry-run] [--force]
+# Env:  PANEL_LAYOUT_SNAPSHOT  explicit snapshot (else newest panels-snapshot-*.json under
+#       $PANEL_STATE_DIR/layout/). The snapshot carries: per-panel x/y/w/h, the left column
+#       (orchestrator panes with pane_id + h), tab_w, tab_h.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+dry=0; force=0
+while [ $# -gt 0 ]; do case "$1" in
+  --dry-run) dry=1; shift;;
+  --force)   force=1; shift;;
+  -h|--help) sed -n '2,34p' "$0"; exit 0;;
+  *) die "unknown arg: $1";;
+esac; done
+
+snap="${PANEL_LAYOUT_SNAPSHOT:-$(ls -t "$PANEL_STATE_DIR"/layout/panels-snapshot-*.json 2>/dev/null | head -1 || true)}"
+[ -n "$snap" ] && [ -s "$snap" ] || die "no layout snapshot in $PANEL_STATE_DIR/layout/ — capture one first"
+
+live_now() { herdr pane list 2>/dev/null; }
+layout_now() { herdr pane layout 2>/dev/null; }
+rect_of() { layout_now | jq -r --arg p "$1" '.result.layout.panes[] | select(.pane_id==$p) | "\(.rect.x) \(.rect.y) \(.rect.width) \(.rect.height)"'; }
+
+# idempotency
+missing=0
+while IFS= read -r l; do
+  live_now | jq -e --arg l "$l" '.result.panes[] | select(.label==$l)' >/dev/null || missing=$((missing + 1))
+done < <(jq -r '.panels | keys[]' "$snap")
+if [ "$missing" = 0 ] && [ "$force" = 0 ]; then
+  printf 'restore: nothing to do — all %s panels already present\n' "$(jq -r '.panels | length' "$snap")"
+  exit 0
+fi
+
+tab_w="$(jq -r '.tab_w' "$snap")"; tab_h="$(jq -r '.tab_h' "$snap")"
+left_w="$(jq -r '.left[0].w' "$snap")"; left_top_h="$(jq -r '.left[0].h' "$snap")"
+grid_order="$(jq -r '.panels | to_entries | sort_by(.value.y, .value.x) | map("\(.key)\t\(.value.x)\t\(.value.y)\t\(.value.w)\t\(.value.h)")[]' "$snap")"
+readarray -t rows_y < <(jq -r '[.panels[].y] | unique | sort[]' "$snap")
+
+if [ "$dry" = 1 ]; then
+  printf 'DRY-RUN: close %s surviving panel pane(s); rebuild: anchor right %s/%s, anchor down %s/%s, grid down 0.5, row splits at snapshot columns; walk orchestrator into the column; swap+close leftover; rename + start:\n' \
+    "$(live_now | jq -r '[.result.panes[] | select((.label // "") | startswith("panel-"))] | length')" "$left_w" "$tab_w" "$left_top_h" "$tab_h"
+  printf '%s\n' "$grid_order" | awk -F'\t' '{printf "  %-32s at (%s,%s) %sx%s\n",$1,$2,$3,$4,$5}'
+  exit 0
+fi
+
+# ---- 1. close surviving panel panes ----------------------------------------------------------------
+while IFS= read -r pid; do
+  herdr pane close "$pid" >/dev/null 2>&1 && printf 'closed surviving %s\n' "$pid" || true
+done < <(live_now | jq -r '.result.panes[] | select((.label // "") | startswith("panel-")) | .pane_id')
+sleep 1
+
+# ---- 2. anchor: the pane at the snapshot left-column top (x==0,y==0) --------------------------------
+anchor="$(layout_now | jq -r '[.result.layout.panes[] | select(.rect.x==0 and .rect.y==0)] | sort_by(.rect.width) | last | .pane_id')"
+[ -n "$anchor" ] && [ "$anchor" != null ] || die "no anchor pane at (0,0)"
+me="$HERDR_PANE_ID"
+printf 'anchor: %s (me: %s)\n' "$anchor" "$me"
+
+# ---- 3. splits -------------------------------------------------------------------------------------
+CWD_DIR="${PANEL_RESTORE_CWD:-$(dirname "$PANEL_MANIFEST")}"
+r1="$(awk -v w="$left_w" -v t="$tab_w" 'BEGIN{printf "%.7f", w/t}')"
+grid="$(herdr pane split --pane "$anchor" --direction right --ratio "$r1" --cwd "$CWD_DIR" --no-focus | jq -r '.result.pane.pane_id')"
+[ -n "$grid" ] && [ "$grid" != null ] || die "grid split failed"
+# anchor column partner (only if anchor currently spans the band height = whole tab)
+anchor_h="$(layout_now | jq -r --arg a "$anchor" '.result.layout.panes[] | select(.pane_id==$a) | .rect.height')"
+if [ "$anchor_h" -ge "$tab_h" ]; then
+  r2="$(awk -v h="$left_top_h" -v t="$tab_h" 'BEGIN{printf "%.7f", h/t}')"
+  spare="$(herdr pane split --pane "$anchor" --direction down --ratio "$r2" --cwd "$CWD_DIR" --no-focus | jq -r '.result.pane.pane_id')"
+  printf 'left column: anchor keeps %s/%s; spare slot %s\n' "$left_top_h" "$tab_h" "$spare"
+fi
+bottom="$(herdr pane split --pane "$grid" --direction down --ratio 0.5 --cwd "$CWD_DIR" --no-focus | jq -r '.result.pane.pane_id')"
+[ -n "$bottom" ] && [ "$bottom" != null ] || die "row split failed"
+printf 'grid %s (top) / %s (bottom)\n' "$grid" "$bottom"
+
+# row splits at snapshot column boundaries; ratio = col_w/remaining (original keeps it)
+row_splits() { # row_splits <first-pane> <y> -> echoes pane ids in column order
+  local cur="$1" y="$2" newp out="$1" i=0 xcur xnext w r
+  mapfile -t xs < <(jq -r --argjson y "$y" '.panels | to_entries | sort_by(.value.x) | .[] | select(.value.y==$y) | .value.x' "$snap")
+  mapfile -t ws < <(jq -r --argjson y "$y" '.panels | to_entries | sort_by(.value.x) | .[] | select(.value.y==$y) | .value.w' "$snap")
+  while [ "$i" -lt $((${#xs[@]} - 1)) ]; do
+    w="$(layout_now | jq -r --arg p "$cur" '.result.layout.panes[] | select(.pane_id==$p) | .rect.width')"
+    r="$(awk -v c="${ws[$i]}" -v w="$w" 'BEGIN{printf "%.7f", c/w}')"
+    newp="$(herdr pane split --pane "$cur" --direction right --ratio "$r" --cwd "$CWD_DIR" --no-focus | jq -r '.result.pane.pane_id')"
+    [ -n "$newp" ] && [ "$newp" != null ] || die "row split failed at column $i"
+    out="$out $newp"; cur="$newp"; i=$((i + 1))
+  done
+  printf '%s\n' "$out"
+}
+top_panes="$(row_splits "$grid" "${rows_y[0]}")"
+bottom_panes="$(row_splits "$bottom" "${rows_y[1]}")"
+printf 'top row:    %s\n' "$top_panes"
+printf 'bottom row: %s\n' "$bottom_panes"
+
+# ---- 4. walk ME (the running orchestrator pane) into its snapshot left-column slot -----------------
+# EMPIRICAL (verified twice live): from the bottom full-width band the walk is UP, LEFT, LEFT —
+# up takes a bottom-row grid slot (a grid pane falls to the band), the two lefts reach the spare
+# left-column slot. Direction is recomputed from live rects each step and each step verified;
+# a step that fails to move aborts the walk (the operator pane is never risked further).
+if [ "$me" != "$anchor" ] && jq -e --arg me "$me" '.left[] | select(.pane_id==$me)' "$snap" >/dev/null; then
+  want="$(jq -r --arg me "$me" '.left[] | select(.pane_id==$me) | "\(.x) \(.y)"' "$snap")"
+  # NOTE: the final (x,y) only exists after the leftover close (rows stretch); walk toward the
+  # COLUMN first (x==left col), y settles when the band is closed below.
+  want_x="${want%% *}"
+  for stepdir in up left left up down; do
+    have="$(rect_of "$me")"; have_x="${have%% *}"
+    # already in the left column -> stop
+    [ "$have_x" = "$want_x" ] && break
+    herdr pane swap --pane "$me" --direction "$stepdir" >/dev/null 2>&1 || true
+    sleep 0.4
+    moved="$(rect_of "$me")"; [ "$moved" != "$have" ] || break   # a no-op swap means the direction is blocked
+  done
+  printf 'orchestrator pane now at (%s)\n' "$(rect_of "$me" | cut -d' ' -f1-2)"
+fi
+
+# ---- 5. ENDGAME (verified live 3x, 2026-09-09): reshape into the final tree --------------------------
+# After the splits the tree is: anchor(left col top) | spare(left col bottom, empty) over the
+# grid; and THIS pane ($me) still sits wherever the kill left it (typically a full-width band
+# below, or the whole left column after the band closed). The deterministic endgame:
+#   a. while a full-width band pane (not me, not anchor) exists:
+#        swap it UP into the grid (it takes a bottom-row slot; a grid pane falls to the band),
+#        then CLOSE the band pane (the one just displaced) -> grid stretches toward full height.
+#   b. if ME holds the whole left column (anchor got displaced into the grid):
+#        split me DOWN at top_h/tab_h (me keeps the top; new spare below), swap me DOWN
+#        (me takes the bottom slot, spare on top), then swap the anchor UP,LEFT back to (0,0)
+#        (anchor climbs out of the grid; the spare takes the anchor's grid slot).
+#   c. final check: exactly 2 left-column panes (anchor + me) + 8 grid panes = 10; else die.
+# Each swap is verified by rect before and after; a no-op swap aborts the step.
+swap_until_moved() { # swap_until_moved <pane> <dir>
+  local before after
+  before="$(rect_of "$1")"
+  herdr pane swap --pane "$1" --direction "$2" >/dev/null 2>&1 || true
+  sleep 0.4
+  after="$(rect_of "$1")"
+  [ "$after" != "$before" ]
+}
+
+# a. collapse every full-width band below the grid (each iteration closes exactly one)
+for _band in 1 2 3; do
+  band="$(layout_now | jq -r '.result.layout.panes[] | select(.rect.width > 200) | select(.pane_id != "'"$me"'") | .pane_id' | head -1 || true)"
+  [ -z "$band" ] && break
+  # a band above the grid means the tree is mid-rebuild; only bands BELOW the grid close here
+  band_y="$(rect_of "$band" | cut -d' ' -f2)"
+  grid_min_y="$(jq -r '[.panels[].y] | min' "$snap")"
+  if [ "$band_y" -ge "$grid_min_y" ]; then
+    swap_until_moved "$band" up || true
+    sleep 0.5
+    band2="$(layout_now | jq -r '.result.layout.panes[] | select(.rect.width > 200) | select(.pane_id != "'"$me"'") | .pane_id' | head -1 || true)"
+    [ -z "$band2" ] || { herdr pane close "$band2" >/dev/null 2>&1 && printf 'closed leftover band %s — grid stretched\n' "$band2"; sleep 1; }
+  else break; fi
+done
+
+# b. me in the left column?
+me_rect="$(rect_of "$me")"; me_w="$(printf '%s' "$me_rect" | cut -d' ' -f3)"
+if [ "$me_w" = "$left_w" ] && [ "$me" != "$anchor" ]; then
+  me_y="$(printf '%s' "$me_rect" | cut -d' ' -f2)"
+  if [ "$me_y" = 0 ]; then
+    # I hold the whole column: split me down (43/23), swap me down, then walk the anchor home
+    r3="$(awk -v h="$left_top_h" -v t="$tab_h" 'BEGIN{printf "%.7f", h/t}')"
+    spare2="$(herdr pane split --pane "$me" --direction down --ratio "$r3" --cwd "$CWD_DIR" --no-focus | jq -r '.result.pane.pane_id')"
+    swap_until_moved "$me" down || true
+    # anchor (displaced into the grid) climbs back: UP then LEFT (verified live)
+    anchor_rect="$(rect_of "$anchor")"
+    if [ "$(printf '%s' "$anchor_rect" | cut -d' ' -f1)" != 0 ]; then
+      swap_until_moved "$anchor" up || true
+      swap_until_moved "$anchor" left || true
+    fi
+  fi
+fi
+
+# c. structural check: 2 left-column panes + grid count
+grid_x_min="$(jq -r '[.panels[].x] | min' "$snap")"
+n_left="$(layout_now | jq -r --arg lw "$left_w" '[.result.layout.panes[] | select(.rect.x==0) | select(.rect.width==($lw|tonumber))] | length')"
+n_grid_now="$(layout_now | jq -r --arg xmin "$grid_x_min" '[.result.layout.panes[] | select(.rect.x >= ($xmin|tonumber))] | length')"
+[ "$n_left" = 2 ] || printf 'WARN left column has %s panes (want 2)\n' "$n_left"
+[ "$n_grid_now" = "$(jq -r '.panels | length' "$snap")" ] || die "grid has $n_grid_now panes, want $(jq -r '.panels|length' "$snap") — layout diverged; run panel-restore again or fix by hand"
+
+# ---- 6. rename BY FINAL SLOT GEOMETRY (not split order — the swap dance moves panes) ----------------
+# the grid panes are the 8 panes inside the snapshot's grid bounding box; sort them y-then-x and
+# assign the snapshot's labels in the same order. A pane carrying a label from an earlier partial
+# run is renamed too (idempotent relabel).
+mapfile -t ordered < <(printf '%s\n' "$grid_order" | cut -f1)
+grid_x_min="$(jq -r '[.panels[].x] | min' "$snap")"
+mapfile -t grid_panes < <(layout_now | jq -r --arg xmin "$grid_x_min" '[.result.layout.panes[] | select(.rect.x >= ($xmin|tonumber))] | sort_by(.rect.y, .rect.x) | .[].pane_id')
+n_grid="${#grid_panes[@]}"
+[ "$n_grid" -eq "$(jq -r '.panels | length' "$snap")" ] || die "expected $(jq -r '.panels|length' "$snap") grid panes, found $n_grid — inspect layout"
+i=0
+for lbl in "${ordered[@]}"; do
+  pane="${grid_panes[$i]}"
+  herdr pane rename "$pane" "$lbl" >/dev/null 2>&1 && printf 'renamed %s -> %s\n' "$pane" "$lbl"
+  i=$((i + 1))
+done
+while IFS=$'\t' read -r label kind; do
+  pane="$(live_now | jq -r --arg l "$label" '.result.panes[] | select(.label==$l) | .pane_id' | head -1)"
+  [ -n "$pane" ] || { printf 'WARN no pane for %s\n' "$label"; continue; }
+  # idempotency: skip when the pane already runs an agent of this kind (a re-run after a partial
+  # restore must not stack a second CLI into a working terminal)
+  cur_kind="$(live_now | jq -r --arg p "$pane" '.result.panes[] | select(.pane_id==$p) | .agent // empty')"
+  if [ "$cur_kind" = "$kind" ]; then
+    printf 'already running %-24s (%s) in %s — skipped\n' "$label" "$kind" "$pane"
+    continue
+  fi
+  # a mismatched/old agent in the terminal: stop it before starting the right one
+  if [ -n "$cur_kind" ] && [ "$cur_kind" != none ] && [ "$cur_kind" != unknown ]; then
+    herdr pane send-keys "$pane" C-c >/dev/null 2>&1 || true; sleep 0.5
+    herdr pane send-text "$pane" "/quit" >/dev/null 2>&1 || true
+    herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true; sleep 2
+  fi
+  name="$(agent_name_from_label "$label")"
+  mapfile -t argv < <(jq -r --arg l "$label" '.panels[$l].start[1:][]?' "$PANEL_MANIFEST" 2>/dev/null || true)
+  tmo="$(manifest_get "$label" '.start_timeout_ms' '90000')"
+  if herdr agent start "$name" --kind "$kind" --pane "$pane" --timeout "$tmo" ${argv[@]+-- "${argv[@]}"} >/dev/null 2>&1; then
+    printf 'started %-32s (%s) in %s\n' "$label" "$kind" "$pane"
+  else
+    printf 'FAILED to start %s (%s) in %s\n' "$label" "$kind" "$pane"
+  fi
+  sleep 2
+done < <(jq -r '.panels | to_entries[] | [.key, .value.kind] | @tsv' "$PANEL_MANIFEST")
+
+# ---- 7. verify -------------------------------------------------------------------------------------
+sleep 5
+fail=0
+while IFS=$'\t' read -r label x y w h; do
+  pane="$(live_now | jq -r --arg l "$label" '.result.panes[] | select(.label==$l) | .pane_id' | head -1)"
+  [ -n "$pane" ] || { printf 'VERIFY FAIL %s: no pane\n' "$label"; fail=$((fail+1)); continue; }
+  rect="$(rect_of "$pane")"
+  if [ "$rect" = "$x $y $w $h" ]; then printf 'OK %s at (%s)\n' "$label" "$rect"
+  else printf 'VERIFY DIFF %s: at (%s) want (%s %s %s %s)\n' "$label" "$rect" "$x" "$y" "$w" "$h"; fail=$((fail+1)); fi
+done < <(printf '%s\n' "$grid_order")
+[ "$fail" = 0 ] && printf '\npanel grid restored: layout + labels + agents verified\n' || die "$fail verification(s) failed"

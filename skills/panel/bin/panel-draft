@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# panel-draft — build and check consensus-draft.md mechanically. Adds no opinion; splits stay splits.
+# Usage: panel-draft <session> [--auto] [--force] [--verify] [--changelog]
+#   (default)   skeleton with <<ORCH: …>> markers (vote tables verbatim, resolved/unresolved D-ids, position changes, corrections)
+#   --auto      U1: no markers — each charter question gets every panel's latest VERDICT verbatim (per-Q sentence when the panel
+#               labelled it, else its whole bottom line), the dissent section lists every minority vote/abstain with its verbatim why,
+#               and an empty "Uncontested findings" section the orchestrator may fill with quoted bullets only. Saves the generated
+#               text to rounds/rN/consensus-draft.generated.md so --verify can tell machine lines from orchestrator lines.
+#   --force     archive an existing draft as rounds/rN/consensus-draft.vK.md and regenerate
+#   --verify    U1/U25 draft gate, exit 1 with the failing lines: every “curly-quoted” passage verbatim (whitespace-normalised) in a
+#               panel answer file AND in the file of the panel named in **bold** on that line (attribution); every line the
+#               orchestrator added is a bullet made of attribution + quotes (≤ 80 chars of connective text) or a `### U<n>.` label ≤ 100
+#               chars; no generated line removed; vote tables match votes.json (panel, letter); no unfilled markers. panel-dispatch ratify runs this.
+#   --changelog D3-B/U21: diff the last DISPATCHED snapshot (rounds/rN/consensus-draft.dispatched.md; fallback consensus-draft.vK.md)
+#               against the current draft → consensus-draft.changelog.md. Every changed hunk must sit in a section whose heading (or
+#               D/U/Q id) an OBJECTION of the last ratify round names, or be text an objection quotes; else ⚠. Exit 1 on any ⚠;
+#               panel-dispatch ratify refuses while ⚠ remain. Short lines are compared whole (U22).
+# Convention: quotes from panel files are written with “ ” so the gate can find them; the orchestrator adds attribution, never words.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+sess=""; force=0; auto=0; verify=0; changelog=0
+while [ $# -gt 0 ]; do case "$1" in --force) force=1; shift;; --auto) auto=1; shift;; --verify) verify=1; shift;; --changelog) changelog=1; shift;; -h|--help) sed -n '2,19p' "$0"; exit 0;; -*) die "unknown arg $1";; *) sess="$1"; shift;; esac; done
+[ -n "$sess" ] || die "usage: panel-draft <session> [--auto] [--force] [--verify] [--changelog]"
+d="$(resolve_session "$sess")"; sid="$(jq -r .session_id "$d/session.json")"; last="$(latest_round "$d")"; shopt -s nullglob
+trap 'rm -f "$d/.corpus" "$d/.pcorpus" "$d/.gen_norm" "$d/.gen_prev_norm" "$d/.draft.diff"' EXIT   # scratch files of --verify / --changelog
+out="$d/consensus-draft.md"
+norm() { tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+gen_prev_file() { # gen_prev_file <prev-draft-file>: the generated snapshot that draft was built from.
+  # D4-C (iteration 8, 4/4): read the record first — round.json of the round that dispatched the draft carries generated_snapshot + generated_sha
+  # (written by panel-dispatch at that moment); a sha mismatch means the snapshot changed since and is refused (every removal then shows ⚠).
+  # Legacy rounds without the record fall back to the mtime inference, bounded by that round's dispatch time (5090 r1 B): newest snapshot
+  # with mtime ≤ the dispatched draft's mtime AND ≤ the dispatch epoch.
+  local r pm rj gs gh de
+  for ((r = last; r >= 1; r--)); do rj="$d/rounds/r$r/round.json"; [ -f "$rj" ] && [ "$(jq -r '.draft_snapshot // empty' "$rj")" = "$1" ] || continue
+    gs="$(jq -r '.generated_snapshot // empty' "$rj")"; gh="$(jq -r '.generated_sha // empty' "$rj")"
+    if [ -n "$gs" ]; then
+      [ -s "$gs" ] || { warn "recorded generated snapshot $gs is missing — D4-A: every removal of generated-looking text is ⚠"; return 1; }
+      [ -z "$gh" ] || [ "$(sha256sum "$gs" | cut -c1-64)" = "$gh" ] || { warn "recorded generated snapshot $gs no longer matches its sha at dispatch — refused (D4-C)"; return 1; }
+      printf '%s' "$gs"; return 0
+    fi
+    de="$(date_epoch "$(jq -r .dispatched_at "$rj")" 2>/dev/null || echo 0)"; break
+  done
+  pm="$(file_mtime "$1")"; [ -n "${de:-}" ] && [ "$de" -gt 0 ] && [ "$de" -lt "$pm" ] && pm="$de"
+  for ((r = last; r >= 1; r--)); do [ -s "$d/rounds/r$r/consensus-draft.generated.md" ] || continue; [ "$(file_mtime "$d/rounds/r$r/consensus-draft.generated.md")" -le "$pm" ] || continue; printf '%s' "$d/rounds/r$r/consensus-draft.generated.md"; return 0; done; return 1; }
+gen_file() { local r; for ((r = last; r >= 1; r--)); do [ -s "$d/rounds/r$r/consensus-draft.generated.md" ] && { printf '%s' "$d/rounds/r$r/consensus-draft.generated.md"; return 0; }; done; return 1; }
+snap_file() { local r; for ((r = last; r >= 1; r--)); do [ -s "$d/rounds/r$r/consensus-draft.dispatched.md" ] && { printf '%s' "$d/rounds/r$r/consensus-draft.dispatched.md"; return 0; }; done
+  for ((r = last; r >= 1; r--)); do arch=("$d"/rounds/r$r/consensus-draft.v*.md); [ "${#arch[@]}" -gt 0 ] && [ -e "${arch[0]}" ] && { printf '%s\n' "${arch[@]}" | sort -V | tail -1; return 0; }; done; return 1; }
+# text of a line outside “…” quotes, backticks, **bold**, (rN …) and pointer tokens — what the orchestrator wrote in their own words
+residual() { printf '%s' "$1" | sed -E 's/“[^”]*”//g; s/`[^`]*`//g; s/\*\*[^*]+\*\*//g; s/\((r[0-9]+[^)]*)\)//g; s/#?C[0-9]+//g; s/\b(r[0-9]+|VOTES|VERDICT|REASONING|CORRECTIONS|OBJECTIONS|NEW CONFLICTS|KEY CLAIMS|RISKS|ASSUMPTIONS|OPEN QUESTIONS|Q[0-9]+|D[0-9]+|U[0-9]+)\b//g; s/^[[:space:]]*[-*][[:space:]]*//; s/[[:space:]·—–:;,.()|/-]+/ /g' | norm; }
+
+# ---------------------------------------------------------------- --verify
+if [ "$verify" = 1 ]; then
+  [ -s "$out" ] || die "no $out"
+  corpus="$(cat "$d"/rounds/r*/in/*.md | norm)"
+  printf '%s\n' "$corpus" > "$d/.corpus"   # grep from a file: `printf … | grep -q` under pipefail returns 141 (SIGPIPE) on an early match in a large corpus
+  fails=0
+  if grep -qE '^[[:space:]]*<<(ORCH|FILL)' "$out"; then warn "unfilled markers:"; grep -nE '^[[:space:]]*<<(ORCH|FILL)' "$out" | cut -c1-120; fails=$((fails + 1)); fi
+  # (1) every quote verbatim somewhere; (2) attribution: the quote occurs in the named panel's own files
+  while IFS= read -r line; do
+    panel="$(printf '%s' "$line" | grep -oE '^\s*(-\s*)?\*\*[^*]+\*\*' | head -1 | sed -E 's/^\s*-?\s*\*\*//; s/\*\*$//' || true)"
+    pcorpus=""; if [ -n "$panel" ] && ls "$d"/rounds/r*/in/"$panel".md >/dev/null 2>&1; then pcorpus="$(cat "$d"/rounds/r*/in/"$panel".md | norm)"; printf '%s\n' "$pcorpus" > "$d/.pcorpus"; fi
+    while IFS= read -r q; do
+      [ "${#q}" -ge 12 ] || continue
+      nq="$(printf '%s' "$q" | norm)"
+      if ! grep -qF -- "$nq" "$d/.corpus"; then printf 'NOT VERBATIM: “%s”\n' "${q:0:140}"; fails=$((fails + 1))
+      elif [ -n "$pcorpus" ] && ! grep -qF -- "$nq" "$d/.pcorpus"; then printf 'MISATTRIBUTED to %s: “%s”\n' "$panel" "${q:0:120}"; fails=$((fails + 1)); fi
+    done < <(printf '%s\n' "$line" | grep -oE '“[^”]+”' | sed 's/^“//; s/”$//')
+  done < <(grep -E '“' "$out")
+  n="$(grep -oE '“[^”]+”' "$out" | wc -l | tr -d ' ')"
+  # (3) orchestrator-added lines vs the generated text: only quoted bullets and short labels; nothing generated removed
+  if gf="$(gen_file)"; then
+    while IFS= read -r l; do
+      case "$l" in
+        -*) t="${l#-}"; [ -n "$(printf '%s' "$t" | norm)" ] || continue
+            printf '%s' "$t" | grep -qxE '[[:space:]]*(none|<<ORCH:.*>>|_Orchestrator fills this section .*_)[[:space:]]*' && continue   # placeholders and the fill-instruction may go (iteration-3 r4 objection)
+            printf 'GENERATED LINE REMOVED: %s\n' "${t:0:120}"; fails=$((fails + 1));;
+        +*) t="${l#+}"; [ -n "$(printf '%s' "$t" | norm)" ] || continue
+            if printf '%s' "$t" | grep -qE '^#{1,3} '; then
+              [ "${#t}" -le 100 ] || { printf 'ADDED HEADING TOO LONG (≤100, label only): %s\n' "${t:0:120}"; fails=$((fails + 1)); }
+            elif printf '%s' "$t" | grep -qE '^[[:space:]]*[-*] ' && printf '%s' "$t" | grep -q '“'; then
+              r="$(residual "$t")"; [ "${#r}" -le 80 ] || { printf 'UNQUOTED PROSE (%s chars outside quotes/attribution): %s\n' "${#r}" "${t:0:140}"; fails=$((fails + 1)); }
+            else printf 'ADDED LINE IS NOT A QUOTED BULLET OR LABEL: %s\n' "${t:0:140}"; fails=$((fails + 1)); fi;;
+      esac
+    done < <(diff -U0 "$gf" "$out" | grep -vE '^(---|\+\+\+|@@)' || true)
+  else warn "no generated snapshot (rounds/rN/consensus-draft.generated.md) — orchestrator-line check skipped (draft not built by --auto)"; fi
+  # (4) vote tables in the draft agree with the record: for every "### D<n> … → **X**" the letters per panel must match final-conflicts.json
+  fcj=""; for ((r = last; r >= 1; r--)); do [ -s "$d/rounds/r$r/final-conflicts.json" ] && { fcj="$d/rounds/r$r/final-conflicts.json"; break; }; done
+  if [ -n "$fcj" ]; then
+    while IFS=$'\t' read -r id panel choice; do
+      row="$(awk -v id="$id" -v p="$panel" '$0 ~ "^### " id " " {s=1; next} /^### /{s=0} s && $0 ~ "^\\| " p "( \\(carried\\))? \\|" {print; exit}' "$out")"
+      [ -n "$row" ] || continue
+      got="$(printf '%s' "$row" | awk -F'|' '{gsub(/^ +| +$/,"",$3); print $3}' | sed -E 's/ \(=.*//')"
+      [ "$got" = "$choice" ] || { printf 'VOTE TABLE MISMATCH %s %s: draft says %s, record says %s\n' "$id" "$panel" "$got" "$choice"; fails=$((fails + 1)); }
+    done < <(jq -r '.[] | .id as $i | .votes[] | [$i, .panel, .choice] | @tsv' "$fcj")
+  fi
+  if [ "$fails" -gt 0 ]; then transcript "$d" draft "verify FAILED: $fails problem(s) in consensus-draft.md"; die "draft gate failed ($fails); $n quotes checked"; fi
+  transcript "$d" draft "verify ok: $n quoted passages verbatim and attributed, orchestrator lines quoted-only, vote tables match"
+  printf 'verify ok: %s quoted passages are verbatim and attributed; orchestrator additions are quoted bullets/labels; vote tables match the record\n' "$n"
+  [ "$changelog" = 1 ] || exit 0
+fi
+
+# ---------------------------------------------------------------- --changelog
+if [ "$changelog" = 1 ]; then
+  prevf="$(snap_file || true)"
+  [ -n "$prevf" ] || die "no dispatched snapshot (rounds/rN/consensus-draft.dispatched.md) or archived draft to diff against"
+  objs=""; lastr=""; for ((r = last; r >= 1; r--)); do [ -f "$d/rounds/r$r/ratify.json" ] && { objs="$(jq -r '.votes[] | .objections[]' "$d/rounds/r$r/ratify.json" | norm)"; lastr=$r; break; }; done
+  [ -n "$objs" ] || warn "no objections recorded in the last ratify round — every edit will be flagged"
+  in_objs() { # in_objs <normalised text> : ≥40-char window, or the whole line when shorter (U22)
+    local t="$1" i; [ -n "$t" ] || return 0
+    if [ "${#t}" -lt 40 ]; then printf '%s' "$objs" | grep -qF -- "$t"; return; fi
+    for ((i = 0; i + 40 <= ${#t}; i += 20)); do printf '%s' "$objs" | grep -qF -- "${t:i:40}" && return 0; done
+    printf '%s' "$objs" | grep -qF -- "${t: -40}"
+  }
+  sec_named() { # sec_named <heading line>: the enclosing section is named by an objection (heading text window or its id token)
+    local h="$1" tok; [ -n "$h" ] || return 1
+    tok="$(printf '%s' "$h" | grep -oE '^#+ +(### )?[A-Z]?[DUQ][0-9]+' | grep -oE '[DUQ][0-9]+' | head -1 || true)"
+    [ -n "$tok" ] && printf '%s' "$objs" | grep -qE "(^|[^A-Za-z0-9])$tok([^0-9]|$)" && return 0
+    in_objs "$(printf '%s' "$h" | sed -E 's/^#+ +//; s/ →.*$//' | norm)"
+  }
+  {
+    printf '# Change log %s → consensus-draft.md (re-ratification after r%s)\n\nGenerated %s by panel-draft --changelog. Every changed hunk must lie in a section an OBJECTION of r%s names (heading or D/U/Q id) or be text an objection quotes (D3-B). ⚠ = outside the objection spans; panel-dispatch ratify refuses while any ⚠ remains.\n\n' "$(basename "$prevf")" "${lastr:-?}" "$(now_iso)" "${lastr:-?}"
+    diff -U0 "$prevf" "$out" > "$d/.draft.diff" || true
+    # iteration 6 (rule 11, needed to proceed): after a ratify ## VOTES move changes a result, the draft is regenerated (U27/U28) and the
+    # mechanical differences (a D-id moving between the resolved and split sections, tables, timestamps) are not orchestrator edits.
+    # An added line that exists in the current generated snapshot, or a removed line that is not orchestrator-shaped (orchestrator lines
+    # can only be quoted `- **panel** … “…”` bullets or `### U<n>.` labels, U25), is marked mechanical instead of ⚠.
+    gf2="$(gen_file || true)"; : > "$d/.gen_norm"
+    [ -z "$gf2" ] || while IFS= read -r x; do printf '%s\n' "$(printf '%s' "$x" | norm)"; done < "$gf2" > "$d/.gen_norm"   # norm eats the newline: normalise, then terminate
+    # read from the file, not a pipe: `printf … | grep -q` under pipefail returns 141 (SIGPIPE) when grep stops at an early match
+    is_gen() { [ -s "$d/.gen_norm" ] && grep -qxF -- "$1" "$d/.gen_norm"; }
+    # D4-A (iteration 7): a REMOVED line is mechanical only if it was generated text — present in the PREVIOUS generated snapshot (the one
+    # the dispatched draft was built from); shape alone proves nothing. Without a previous snapshot every removal of generated-looking text is ⚠.
+    gp="$(gen_prev_file "$prevf" || true)"; : > "$d/.gen_prev_norm"
+    [ -z "$gp" ] || while IFS= read -r x; do printf '%s\n' "$(printf '%s' "$x" | norm)"; done < "$gp" > "$d/.gen_prev_norm"
+    is_gen_prev() { [ -s "$d/.gen_prev_norm" ] && grep -qxF -- "$1" "$d/.gen_prev_norm"; }
+    orch_shaped() { printf '%s' "$1" | grep -qE '^(- \*\*[^*]+\*\*.*“|### U[0-9]+\.)'; }
+    heading=""; sec2=""
+    # walk the NEW file to know each added line's section; removed lines take the section of the hunk's position in the new file
+    # U45 (iteration 3): read the diff directly — the former `awk 'NR==FNR{next} 1' /dev/null …` skipped every line and the log was always empty
+    while IFS= read -r l; do
+      case "$l" in
+        @@*) nl="$(printf '%s' "$l" | sed -E 's/^@@ -[0-9,]+ \+([0-9]+).*/\1/')"; heading="$(head -n "$nl" "$out" | grep -E '^#{1,3} ' | tail -1 || true)"
+             sec2="$(head -n "$nl" "$out" | grep -E '^## ' | tail -1 || true)";;   # U45: the enclosing level-2 section counts too (an added ### label sits inside it)
+        ---*|+++*) ;;
+        -*) t="$(printf '%s' "${l#-}" | norm)"; [ -n "$t" ] || continue; flag=""
+            if is_gen_prev "$t"; then flag="  (mechanical: generated line, present in the previous generated snapshot)"
+            # iteration 10 fix (re-ratification of a hand-written draft): when no generated snapshot exists to prove provenance,
+            # a removed non-orchestrator-shaped line is treated like an added one — it clears if an objection quotes it or names its
+            # section. Previously this hard-flagged D4-A ("not found in the previous generated snapshot") even though claude/codex's
+            # objections named the exact section and quoted the span, blocking a correct re-ratification (D3-B/D4-A interaction).
+            elif ! orch_shaped "$t"; then in_objs "$t" || sec_named "$heading" || sec_named "$sec2" || flag="  ⚠ removed text neither quoted by nor in a section named by any r${lastr} objection — D4-A (no generated snapshot to prove provenance)"
+            else in_objs "$t" || sec_named "$heading" || sec_named "$sec2" || flag="  ⚠ removed text neither quoted by nor in a section named by any r${lastr} objection"; fi
+            printf -- '- REMOVED [%s]: %s%s\n' "$(printf '%s' "$heading" | cut -c1-60)" "${t:0:400}" "$flag";;
+        +*) t="$(printf '%s' "${l#+}" | norm)"; [ -n "$t" ] || continue; flag=""
+            printf '%s' "${l#+}" | grep -qE '^#{1,3} ' && heading="${l#+}"
+            printf '%s' "${l#+}" | grep -qE '^## ' && sec2="${l#+}"
+            if is_gen "$t"; then flag="  (mechanical: generated line)"
+            else in_objs "$t" || sec_named "$heading" || sec_named "$sec2" || flag="  ⚠ added text in a section no r${lastr} objection names"; fi
+            printf -- '- ADDED   [%s]: %s%s\n' "$(printf '%s' "$heading" | cut -c1-60)" "${t:0:400}" "$flag";;
+      esac
+    done < "$d/.draft.diff"
+  } > "$d/consensus-draft.changelog.md"; rm -f "$d/.draft.diff" "$d/.gen_norm" "$d/.gen_prev_norm"
+  warnings="$(grep -c '^- .*⚠' "$d/consensus-draft.changelog.md" || true)"
+  transcript "$d" draft "changelog written vs $(basename "$prevf") ($warnings edit(s) outside objection spans)"
+  printf '%s\n%s edit(s) outside objection spans%s\n' "$d/consensus-draft.changelog.md" "$warnings" "$([ "${warnings:-0}" -gt 0 ] && printf ' — D3-B: revert them or turn them into D-ids; ratify dispatch is refused until this is 0')"
+  [ "${warnings:-0}" -eq 0 ] && exit 0 || exit 1
+fi
+
+# ---------------------------------------------------------------- skeleton / --auto
+if [ -s "$out" ]; then
+  [ "$force" = 1 ] || die "$out exists — edit it, --changelog to diff it, or --force to archive it and regenerate"
+  k=1; while [ -e "$d/rounds/r$last/consensus-draft.v$k.md" ]; do k=$((k + 1)); done
+  cp "$out" "$d/rounds/r$last/consensus-draft.v$k.md"; transcript "$d" draft "archived previous draft as rounds/r$last/consensus-draft.v$k.md"
+fi
+votes=""; vr=0; for ((r = last; r >= 1; r--)); do [ -f "$d/rounds/r$r/votes.json" ] && { votes="$d/rounds/r$r/votes.json"; vr=$r; break; }; done
+lastp=""; pr=0; for ((r = last; r >= 1; r--)); do [ -f "$d/rounds/r$r/panels.json" ] && [ "$(jq -r .type "$d/rounds/r$r/round.json")" != ratify ] && { lastp="$d/rounds/r$r/panels.json"; pr=$r; break; }; done
+[ -n "$lastp" ] || die "no analysed round yet (run panel-matrix first)"
+# latest verdict per panel across all non-ratify rounds (a panel absent from the last round keeps its earlier verdict)
+latest_verdicts="$(for ((r = 1; r <= last; r++)); do [ -f "$d/rounds/r$r/panels.json" ] || continue; [ "$(jq -r .type "$d/rounds/r$r/round.json")" = ratify ] && continue; jq -c --argjson r "$r" '.[] | select(.hard_ok and (.verdict|length)>0) | {panel, round:$r, file, confidence, verdict}' "$d/rounds/r$r/panels.json"; done | jq -s 'group_by(.panel) | map(max_by(.round))')"
+q_section() { # q_section <n> : per panel, the sentence labelled Qn (also "Q1/Q2:") in its latest verdict, else the whole verdict (labelled once)
+  local n="$1"
+  printf '%s' "$latest_verdicts" | jq -r --argjson n "$n" '.[] | . as $p | (.verdict | gsub("\n";" ")) as $v
+    | ($v | [match("\\**Q([1-9])(?:/Q([1-9]))?[:.]\\**\\s*(.*?)(?=\\**Q[1-9](?:/Q[1-9])?[:.]|$)"; "g") | {q: [(.captures[0].string|tonumber), (.captures[1].string | if . == null then empty else tonumber end)], t: (.captures[2].string|gsub("^\\s+|\\s+$";""))}]) as $parts
+    | ([range(1;5) | select(. as $k | any($parts[]; .q | index($k)) | not)]) as $missing
+    # iteration 7 (claude r4 correction): a verdict that labels only some questions is not silent on the others — the whole verdict is
+    # quoted under the first unlabelled question and the later ones point at it (before: only the labelled fragments were attributed)
+    | if any($parts[]; .q | index($n)) then (($parts[] | select(.q | index($n))) | "- **\($p.panel)** (r\($p.round), `\($p.file)`): “\(.t)”")
+      elif $n == $missing[0] then "- **\($p.panel)** (r\($p.round), `\($p.file)`, one bottom line covering every question not labelled separately): “\($v)”"
+      else "- **\($p.panel)** (r\($p.round)): see its bottom line under Q\($missing[0])." end'
+}
+fc=""
+{
+  printf '# Consensus draft — %s\n\n' "$sid"
+  if [ "$auto" = 1 ]; then
+    printf '_Generated %s by panel-draft --auto (mechanical). Every quoted passage is verbatim from a panel answer file; the orchestrator added attribution and structure only. Splits are recorded, not resolved._\n\n' "$(now_iso)"
+    # U42 (iteration 3): which skill tree each round ran against — line cites in the answers refer to these revisions
+    revs="$(for rj in "$d"/rounds/r*/round.json; do jq -r 'select(.skill_rev != null) | "r\(.round) \(.skill_version // "?")@\(.skill_rev)"' "$rj"; done | paste -sd ',' - | sed 's/,/, /g')"
+    if [ -n "$revs" ]; then
+      nrev="$(for rj in "$d"/rounds/r*/round.json; do jq -r '.skill_rev // empty' "$rj"; done | sort -u | wc -l)"
+      printf '_Skill tree at dispatch (U42): %s%s_\n\n' "$revs" "$([ "$nrev" -gt 1 ] && printf ' — CHANGED MID-SESSION: line cites from earlier rounds refer to an earlier revision (see transcript.md TOOLING entries)')"
+    fi
+  else
+    printf '_Skeleton generated %s by panel-draft (mechanical). Orchestrator: replace every `<<ORCH: …>>` with passages **quoted** from `rounds/rN/in/<panel>.md` in “curly quotes” with per-panel attribution; keep every vote table; add no opinion; leave splits as splits. `panel-dispatch … ratify` runs `panel-draft --verify`._\n\n' "$(now_iso)"
+  fi
+  printf '## Charter questions — the panels'"'"' verdicts, verbatim\n\n'
+  n=0
+  grep -E '^Q[0-9]+\.' "$d/charter.md" | while IFS= read -r q; do
+    n=$((n + 1)); printf '### %s\n' "$q"
+    if [ "$auto" = 1 ]; then q_section "$n"; printf '\n'
+    else printf '<<ORCH: quote (“…”) the verdict sentence(s) each panel gave for this question in its latest answer; name the panel and the file; if panels differ, list each — do not blend>>\n\n'; fi
+  done
+  printf '## Latest VERDICT sections, verbatim (each panel'"'"'s last round that carries a VERDICT section; later focus/ratify moves sit in the vote tables and the Position changes log)\n\n'
+  printf '%s' "$latest_verdicts" | jq -r '.[] | "- **\(.panel)** (r\(.round), `\(.file)`, confidence \(.confidence // "-")): “\(.verdict | gsub("\n"; " "))”"'
+  printf '\n'
+  if [ -n "$votes" ]; then
+    # latest state of every conflict across all rounds (non-ratify tallies carry the record; ratify VOTES tallies count too)
+    jq -s '[ .[] | .round as $r | .type as $t | .conflicts[] | select(.id != "D0") | . + {round: $r, rtype: ($t // "cross")} ] | group_by(.id) | map(max_by(.round)) | sort_by(.id | ltrimstr("D") | tonumber)' "$d"/rounds/r*/votes.json > "$d/rounds/r$vr/final-conflicts.json"
+    fc="$d/rounds/r$vr/final-conflicts.json"
+    printf '## Resolved conflicts (by the panels'"'"' votes; each shown from the last round in which it was voted)\n\n'
+    jq -r '.[] | select(.resolved) | "### \(.id) — \(.topic) → **\(.agreed)** (r\(.round) \(.rtype))" + (if .via_equivalence then " (voter-declared equivalence, every holder declared: " + (.equivalences | map(join("≡")) | join(", ")) + " — ratification confirms)" else "" end) + (if ((.unheld // [])|length) > 0 then " — unopposed among the panels present; unheld position(s): " + (.unheld | map("\(.letter) (held by \(.held_by|join(", ")), absent)") | join("; ")) else "" end)
+      + "\n" + ([.agreed_letters[] as $l | "- position \($l): \(.positions[$l].summary // "(new position, see vote line)")"] | join("\n"))
+      + "\n\n| panel | vote | why (verbatim) |\n|---|---|---|\n" + (.votes | map("| \(.panel)\(if .carried then " (carried)" else "" end) | \(.choice)\(if (.eq|length)>0 then " (=\(.eq|join(",")))" else "" end) | \(.why | gsub("\n"; " ") | gsub("\\|"; "\\\\|")) |") | join("\n")) + "\n"' "$fc"
+    [ "$(jq '[.[]|select(.resolved)]|length' "$fc")" -gt 0 ] || printf 'none\n'
+    printf '\n## Unresolved conflicts (recorded as SPLIT — the orchestrator does not resolve them)\n\n'
+    jq -r '.[] | select(.resolved | not) | "### \(.id) — \(.topic) — (r\(.round) \(.rtype)) " + (if .all_abstain then "all abstained" elif (.missing|length)>0 then "missing votes: \(.missing|join(", "))" else "split " + (.tally | to_entries | map("\(.key):\(.value)") | join(" ")) end)
+      + "\n" + (.positions | to_entries | map("- position \(.key): \(.value.summary)") | join("\n")) + ((.new_positions // []) | map("\n- position \(.letter) (new, by \(.panel)): \(.text)") | join(""))
+      + (if ((.proposed_equivalences // []) | length) > 0 then "\n- proposed equivalence(s) not merged (D9-A): " + (.proposed_equivalences | map("\(.pair|join("="))" + " declared by " + (.declared_by|join(",")) + ", not declared by " + (.undeclared_holders|join(","))) | join("; ")) else "" end)
+      + "\n\n| panel | vote | why (verbatim) |\n|---|---|---|\n" + (.votes | map("| \(.panel) | \(.choice)\(if (.eq|length)>0 then " (=\(.eq|join(",")))" else "" end) | \(.why | gsub("\n"; " ") | gsub("\\|"; "\\\\|")) |") | join("\n")) + "\n"' "$fc"
+    [ "$(jq '[.[]|select(.resolved|not)]|length' "$fc")" -gt 0 ] || printf 'none\n'
+    printf '\n## Position changes across rounds (from the vote files)\n\n'
+    jq -s -r '[ .[] | .round as $r | .conflicts[] | .id as $id | .votes[] | select(.carried | not) | {id: $id, panel, round: $r, choice} ]
+      | group_by(.id, .panel) | map(select(length > 1) | sort_by(.round) | select((map(.choice) | unique | length) > 1) | "- \(.[0].id) \(.[0].panel): " + (map("r\(.round)=\(.choice)") | join(" → ")))
+      | if length == 0 then "none" else .[] end' "$d"/rounds/r*/votes.json
+  else
+    printf '## Conflicts\n\nNo cross-review round: `rounds/r1/disagreements.json` lists no conflicts.\n'
+  fi
+  printf '\n## Corrections raised (factual fixes to the record; listed, not voted; exact duplicates removed, first attribution kept)\n\n'
+  # a round with no corrections writes a bare 'none' into its corrections.md — never let it close a populated list (iteration-2 audit, iteration-3 r4 objection)
+  clist="$(for c in "$d"/rounds/r*/corrections.md; do sed '1,3d' "$c" | sed '/^[[:space:]]*$/d;/^[[:space:]]*none[[:space:]]*$/d'; done | awk '{k=$0; sub(/^- \*\*[^*]+\*\*: /,"",k); if(!seen[k]++) print}')"
+  if [ -n "$clist" ]; then printf '%s\n' "$clist"; else printf 'none\n'; fi
+  up_list="$(for vf in "$d"/rounds/r*/votes.json; do [ -s "$vf" ] && jq -r '.round as $r | (.promotions // [])[] | select(.ok | not) | "- r\($r) \(.panel): \(.line)"' "$vf"; done)"
+  if [ -n "$up_list" ]; then printf '\n## PROMOTE lines that did not parse (D16/U52: each kept its round open until restated or dropped — recorded, not voted)\n\n%s\n' "$up_list"; fi
+  printf '\n## Uncontested findings — raised by one or more panels and contradicted by none (quoted verbatim; listed for ratification; objecting to any is a valid `no`)\n\n'
+  # U41 (iteration 3): PROMOTE … | SECOND lines are seconded claims, not disputes — listed here mechanically, each quote verbatim from the cited panel's file
+  # D19-A (iteration 4): read secondings from every round's votes.json (written whether or not the round converged), not from the carry draft that a converged round never writes
+  # iteration 6 (rule 11, needed to proceed): a seconder's quote that is NOT verbatim in the cited panel's files is recorded as the
+  # seconder's own words, so the bullet stays true and --verify's attribution check (bold panel = the file holding the quote) passes;
+  # the tally accepts a PROMOTE on format alone and does not check the quote against the cited file — that gap goes to the panels.
+  # iteration 7 (claude r4 correction): one claim seconded by several panels is ONE entry with every seconder listed, not one bullet per seconder
+  US="$(printf '\x1f')"
+  sec_list="$( { for vf in "$d"/rounds/r*/votes.json; do [ -s "$vf" ] || continue
+    jq -r '.round as $r | (.promotions // [])[] | select(.ok and (.seconding // false)) | [($r|tostring), .panel, .cited_panel, .anchor, .quote] | join("\u001f")' "$vf" | while IFS=$'\x1f' read -r r p cp an q; do
+      # iteration 9 (claude r4 correction): a seconder that escaped the inner quotes (`\"n/a\"`) still cites the claim verbatim — unescape before matching
+      qu="$(printf '%s' "$q" | sed 's/\\"/"/g')"
+      if cat "$d"/rounds/r*/in/"$cp".md 2>/dev/null | norm | grep -qF -- "$(printf '%s' "$qu" | norm)"; then
+        printf 'V%s%s%s%s%s%s%s%s%s%s\n' "$US" "$cp" "$US" "$an" "$US" "$qu" "$US" "$p" "$US" "$r"
+      else   # iteration 9 (claude r4 correction, 5090 r4 correction): the relabelled path merges seconders too, and the note says whose files lack the quote
+        printf 'N%s%s%s%s%s%s%s%s%s%s\n' "$US" "$cp" "$US" "$an" "$US" "$q" "$US" "$p" "$US" "$r"
+      fi
+    done; done; } | awk -F "$US" '
+      $1=="V" { k=$2 FS $3 FS $4; if (!(k in sec)) { order[++n]=k; cp[k]=$2; an[k]=$3; q[k]=$4; sec[k]=$5 " r" $6 } else if (index(sec[k], $5 " r" $6)==0) sec[k]=sec[k] ", " $5 " r" $6; next }
+      $1=="N" { k=$2 FS $3 FS $4; if (!(k in nsec)) { norder[++nn]=k; ncp[k]=$2; nan[k]=$3; nq[k]=$4; nfirst[k]=$5; nr[k]=$6; nsec[k]=$5 " r" $6 } else if (index(nsec[k], $5 " r" $6)==0) nsec[k]=nsec[k] ", " $5 " r" $6; next }
+      !seen[$0]++ { other[++m]=$0 }
+      END { for (i=1;i<=n;i++) { k=order[i]; printf "- **%s** #%s (seconded by %s PROMOTE): “%s”\n", cp[k], an[k], sec[k], q[k] }
+            for (i=1;i<=nn;i++) { k=norder[i]; printf "- **%s** r%s PROMOTE of %s#%s (quote is not verbatim in %s'"'"'s files — recorded as the seconders'"'"' words: %s): “%s”\n", nfirst[k], nr[k], ncp[k], nan[k], ncp[k], nsec[k], nq[k] }
+            for (i=1;i<=m;i++) print other[i] }')"
+  [ -z "$sec_list" ] || printf '%s\n\n' "$sec_list"
+  printf '_Orchestrator fills this section with bullets only: `- **<panel>** r<N> C<n>: “<verbatim>”` under an optional `### U<n>. <label>` line. Nothing else may be added anywhere in this draft (panel-draft --verify enforces it). Voted D-ids are not repeated here._\n\nnone\n'
+  printf '\n## Participation\n\n| round | type | answered | late | absent (state: reason) |\n|---|---|---|---|---|\n'
+  for cj in "$d"/rounds/r*/collect.json; do
+    rr="$(dirname "$cj")"
+    jq -r --arg t "$(jq -r .type "$rr/round.json")" --slurpfile M <(jq -s '.' "$rr"/meta/*.json) '"| r\(.round) | \($t) | \((.answered_unconfirmed // []) as $u | .answered | map(. as $p | if ($u|index($p)) != null then $p + " (file unconfirmed)" else $p end) | join(", ")) | \((.answered_late//[])|join(", ")) | \([$M[0][] | select(.state|IN("no-response","timeout","gone","budget-exhausted","failed","skipped")) | "\(.panel) (\(.state): \(.reason|.[0:60]))"] | join("; ")) |"' "$cj"
+  done
+  printf '\n## Dissent and abstentions carried into the record\n\n'
+  if [ "$auto" = 1 ]; then
+    if [ -n "$fc" ]; then
+      jq -r '.[] | . as $c | ($c.tally | to_entries | map(select(.key|test("^[A-Z]$"))) | sort_by(-.value) | .[0].key // "") as $maj
+        | $c.votes[] | .choice as $ch | select($ch=="abstain" or (($ch|test("^[A-Z]$")) and (($c.agreed_letters|index($ch))==null) and ($ch != $maj or ($c.resolved|not))))
+        | "- \($c.id) \(if $c.resolved then "(resolved \($c.agreed))" else "(split)" end) — **\(.panel)** voted \(.choice)\(if (.eq|length)>0 then " (=\(.eq|join(",")))" else "" end): “\(.why|gsub("\n";" "))”"' "$fc"
+      [ "$(jq '[.[] | . as $c | $c.votes[] | .choice as $ch | select($ch=="abstain" or (($ch|test("^[A-Z]$")) and (($c.agreed_letters|index($ch))==null)))] | length' "$fc")" -gt 0 ] || printf 'no vote dissent — every vote cast joined the agreed letter (a dispute on an unballoted item, when the orchestrator records one from the answer files, follows below)\n'
+    else printf 'none — no conflicts were voted (blind round only)\n'; fi   # U26: the no-votes path emits a mechanical line, never a marker
+    printf -- '- Panels absent from any round are listed in Participation with the recorded reason.\n'
+  else
+    printf '<<ORCH: list every abstain and every minority vote above in one line each, quoting (“…”) the panel'"'"'s own why; delete this marker if there are none>>\n'
+  fi
+} > "$out"
+[ "$auto" = 1 ] && cp "$out" "$d/rounds/r$last/consensus-draft.generated.md"
+transcript "$d" draft "consensus-draft.md $([ "$auto" = 1 ] && printf 'generated (--auto; snapshot rounds/r%s/consensus-draft.generated.md)' "$last" || printf 'skeleton written') (votes from r$vr, verdicts from r$pr)"
+printf '%s\nmarkers to fill: %s\n' "$out" "$(grep -cE '^[[:space:]]*<<ORCH' "$out" || true)"
+[ "$auto" = 1 ] && "$0" "$d" --verify

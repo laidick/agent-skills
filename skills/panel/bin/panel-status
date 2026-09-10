@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# panel-status — one-screen view of a session: state, rounds, per-panel status of the latest (or given) round.
+# Usage: panel-status <session> [round]
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+[ $# -ge 1 ] || die "usage: panel-status <session> [round]"
+d="$(resolve_session "$1")"; round="${2:-$(latest_round "$d")}"
+shopt -s nullglob
+jq -r '"session  \(.session_id)\nstate    \(.state)\nrounds   max_discussion=\(.max_rounds)"' "$d/session.json"
+for rj in "$d"/rounds/r*/round.json; do
+  r="$(jq -r .round "$rj")"; c="$(dirname "$rj")/collect.json"
+  if [ -f "$c" ]; then jq -r '"  r\(.round): " + (input|.type) + "  answered=\(.answered|length) no_response=\(.no_response|length) timeout=\(.timeout|length) blocked=\(.blocked|length) pending=\(.pending|length)"' "$c" "$rj"
+  else jq -r '"  r\(.round): \(.type)  (not collected)"' "$rj"; fi
+done
+
+# v1.12.0 — pane-reuse isolation: what the r1 gate will read for every panel pane
+printf '\npane isolation (context-reset state; only `clean` panes may receive a blind round):\n'
+printf '%-30s %-8s %-9s %-9s %-20s %s\n' PANEL CLEAN ATTEMPTED VERIFIED RESET_AT REASON
+sid="$(jq -r '.session_id // empty' "$d/session.json")"
+if [ -f "$PANEL_MANIFEST" ]; then
+  while IFS= read -r label; do
+    IFS=$'\t' read -r cl cr < <(reset_check "$label" "$sid")
+    printf '%-30s %-8s %-9s %-9s %-20s %s\n' "${label#$PANEL_PREFIX}" "$cl" \
+      "$(reset_state_get "$label" '.reset_attempted' false)" "$(reset_state_get "$label" '.reset_verified' false)" \
+      "$(reset_state_get "$label" '.reset_at' -)" "${cr:0:90}"
+  done < <(jq -r '.panels | keys[]' "$PANEL_MANIFEST")
+else printf '(no manifest at %s)\n' "$PANEL_MANIFEST"; fi
+
+[ "$round" -ge 1 ] || exit 0
+rd="$d/rounds/r$round"; [ -d "$rd/meta" ] || exit 0
+printf '\nround %s panels:\n%-30s %-7s %-9s %-12s %-8s %-6s %s\n' "$round" PANEL PANE KIND STATE LIVE FILE REASON
+for m in "$rd"/meta/*.json; do
+  panel="$(basename "$m" .json)"; pane="$(jq -r .pane_id "$m")"
+  live="$(agent_status "$pane")"; f="$rd/in/$panel.md"; size="-"; [ -s "$f" ] && size="$(wc -c < "$f" | tr -d ' ')"
+  jq -r --arg live "$live" --arg size "$size" '[.panel, .pane_id, .kind, .state, $live, $size, (.reason // "")] | @tsv' "$m" \
+    | awk -F'\t' '{printf "%-30s %-7s %-9s %-12s %-8s %-6s %s\n",$1,$2,$3,$4,$5,$6,$7}'
+done
+printf 'NEXT: %s\n' "$("$(dirname "$0")/panel-next" "$d")"

@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# panel-collect — wait for the panels of a round to finish; verify answer files; capture evidence.
+# Usage: panel-collect <session> [round] [--timeout S] [--poll S] [--once] [--wait-for p1,p2]
+# Resumable: state lives in rounds/rN/meta/*.json, so re-running continues where it stopped.
+# Completion rule per panel: agent settled (idle|done) AND answer file exists, non-empty, mtime >= dispatch.
+# Never matches on screen text for completion (stale-echo hazard). Never answers dialogs.
+# Failure classification (screen text, data only): usage-limit → budget state written, panel skipped until reset;
+# transient (network/5xx) → one extra nudge; auth/context-window → failed immediately; permission-dialog → blocked.
+# Late answers: a panel that was no-response/timeout but whose file appears later is merged as `answered-late`
+# on the next call (or run `panel-collect <s> <r> --once` before panel-matrix).
+# Per-panel timeout = meta.timeout_s (manifest) — local models get longer windows than subscriptions.
+# D4-A (ratified 2026-09-05): a settled panel with no file is NEVER dropped before its own timeout_s — nudges are
+# reminders, not a countdown; only hard provider failures (usage-limit/auth/context-window) end it early.
+# Queued briefs (U15): a panel that was `working` at dispatch has state `queued`; collect delivers the pointer once it
+# settles, then the clock starts. Undelivered panels are never nudged.
+# Optional quorum exit (D4-E, off by default): PANEL_QUORUM_EXIT=<pct> — in non-blind rounds, once >= pct of dispatched
+# panels answered, settled-no-file stragglers slower than 2x the median latency are closed as `no-response`;
+# never fires while any panel is still working, and never before THAT panel's own timeout_s (read from its meta, U18/U37).
+# After ratification (U6/U29) collect only records late files as post-consensus; it never changes session state.
+# Exit: 0 all panels terminal with >=1 answer · 1 all terminal but zero answers · 3 still pending (window over)
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+sess=""; round=""; timeout="$PANEL_COLLECT_TIMEOUT_S"; poll=5; once=0; waitfor=""
+while [ $# -gt 0 ]; do case "$1" in
+  --timeout) timeout="$2"; shift 2;;
+  --poll) poll="$2"; shift 2;;
+  --once) once=1; shift;;
+  --wait-for) waitfor="$2"; shift 2;;
+  -h|--help) sed -n '2,20p' "$0"; exit 0;;
+  -*) die "unknown arg: $1";;
+  *) if [ -z "$sess" ]; then sess="$1"; elif [ -z "$round" ]; then round="$1"; else die "too many args"; fi; shift;;
+esac; done
+[ -n "$sess" ] || die "usage: panel-collect <session> [round] [--timeout S] [--poll S] [--once] [--wait-for p1,p2]"
+d="$(resolve_session "$sess")"
+[ -n "$round" ] || round="$(latest_round "$d")"
+[ "$round" -ge 1 ] || die "no round dispatched yet"
+rd="$d/rounds/r$round"; [ -d "$rd/meta" ] || die "round $round has no meta/"
+type="$(jq -r .type "$rd/round.json")"
+sid="$(jq -r '.session_id // empty' "$d/session.json")"
+shopt -s nullglob
+start="$(now_epoch)"; deadline=$((start + timeout))
+
+set_state() { # set_state <panel> <state> [reason] [class]
+  json_set "$rd/meta/$1.json" '.state=$s | .reason=$r | .updated=$t | (if $c != "" then .reason_class=$c else . end)' --arg s "$2" --arg r "${3:-}" --arg t "$(now_iso)" --arg c "${4:-}"
+  transcript "$d" "r$round" "$1 → $2${3:+ ($3)}${4:+ [$4]}"
+}
+capture_raw() { herdr agent read "$1" --source recent-unwrapped --lines 150 > "$rd/raw/$2.txt" 2>/dev/null || true; }
+mark_answered() { # mark_answered <panel> <meta> <ans> <state>
+  local lat bytes; lat=$(( $(file_mtime "$3") - $(jq -r .dispatched_at_epoch "$2") )); bytes="$(wc -c < "$3" | tr -d ' ')"
+  json_set "$2" '.latency_s=$l | .answer_bytes=$b' --argjson l "$lat" --argjson b "$bytes"
+  set_state "$1" "$4" "$bytes bytes in ${lat}s"
+}
+# file_quiet <file>: the file stopped changing at least PANEL_FILE_QUIET_S ago (D3-B, iteration 8, 4/4). A debounce, not a completion proof —
+# a paused partial write can satisfy it (codex C4, iteration 9); a panel still streaming its answer is left pending and the window re-arms, agy C7 / 5090 r2)
+file_quiet() { [ $(( $(now_epoch) - $(file_mtime "$1") )) -ge "$PANEL_FILE_QUIET_S" ]; }   # claude C9 (iteration 9): its own knob, defaulting to the probe interval
+SWEPT=0
+unconfirmed_sweep() { # U69 (iteration 7): at the end of a collect window a pending panel whose answer file exists is marked answered (unconfirmed by settle)
+  local mm p a dsp; SWEPT=0
+  for mm in "$rd"/meta/*.json; do
+    p="$(jq -r .panel "$mm")"; case "$(jq -r .state "$mm")" in dispatched|nudged|working) ;; *) continue;; esac
+    a="$rd/in/$p.md"; dsp="$(jq -r '.brief_epoch // .dispatched_at_epoch' "$mm")"   # iteration 9 (orchestrator, spark r3): an answer is fresh if it postdates the BRIEF, not a later queued delivery
+    [ -s "$a" ] && [ "$(file_mtime "$a")" -ge "$dsp" ] || continue
+    if ! file_quiet "$a"; then transcript "$d" "r$round" "$p: answer file still changing at collect window end — not swept (D3-B); re-arm"; printf '.. %s: answer file still being written at collect end — left pending (D3-B), re-run panel-collect\n' "$p"; continue; fi
+    json_set "$mm" '.unconfirmed=$u' --arg u "answer file present, agent unsettled at collect window end — U69: the file is the answer"
+    mark_answered "$p" "$mm" "$a" answered; SWEPT=$((SWEPT + 1)); printf '.. %s: answer file present, agent unsettled at collect end — marked answered (file unconfirmed by settle, U69)\n' "$p"
+  done
+}
+# classify the pane's visible screen; sets globals CLS and HINT; saves the screen to raw/<panel>.screen.txt
+PANEL_STUCK_SCREEN_S="${PANEL_STUCK_SCREEN_S:-90}"   # debounce only (D2-A/U66, iteration 6): a WORKING agent's screen class is recorded, never acted on; at timeout a usage-limit class needs a screen static this long
+classify_pane() {
+  local screen; screen="$(herdr pane read "$1" --source visible 2>/dev/null || true)"
+  printf '%s\n' "$screen" > "$rd/raw/$2.screen.txt"
+  IFS=$'\t' read -r CLS HINT < <(printf '%s' "$screen" | classify_screen)
+  # iteration 5 (orchestrator-observed, 4 false positives): a provider=local panel has no quota — a "usage limit" on its screen is
+  # text it is reading (budget code, state files), never a banner about itself
+  if [ "$CLS" = usage-limit ] && [ "$(manifest_get "$(label_of "$2")" '.provider' '')" = local ]; then CLS=unknown; HINT=""; fi
+}
+label_of() { jq -r --arg p "$1" '.panels[] | select(.panel==$p) | .label' "$rd/roster.json"; }
+
+# --- late merge: terminal-without-answer panels whose file has since appeared
+for m in "$rd"/meta/*.json; do
+  panel="$(basename "$m" .json)"; st="$(jq -r .state "$m")"
+  case "$st" in no-response|timeout|failed|gone|budget-exhausted|skipped) ;; *) continue;; esac
+  ans="$rd/in/$panel.md"; disp="$(jq -r '.brief_epoch // .dispatched_at_epoch' "$m")"   # brief_epoch: the mtime of the brief the panel answers (queued delivery does not move it)
+  if [ -s "$ans" ] && [ "$(file_mtime "$ans")" -ge "$disp" ]; then
+    if [ "$(jq -r .state "$d/session.json")" = ratified ] || [ -s "$d/consensus.md" ]; then
+      mark_answered "$panel" "$m" "$ans" answered-post-consensus     # U6: reported, never merged into consensus.md
+      printf '++ %s answered after ratification (was %s) — recorded as post-consensus, consensus.md untouched\n' "$panel" "$st"
+    else
+      mark_answered "$panel" "$m" "$ans" answered-late
+      printf '++ %s answered late (was %s) — merged\n' "$panel" "$st"
+    fi
+  fi
+done
+
+while :; do
+  pending=0; summary=""
+  for m in "$rd"/meta/*.json; do
+    panel="$(basename "$m" .json)"
+    st="$(jq -r .state "$m")"
+    case "$st" in queued|dispatched|nudged|working|blocked) ;; *) continue;; esac
+    pane="$(jq -r .pane_id "$m")"; disp="$(jq -r .dispatched_at_epoch "$m")"; fresh="$(jq -r '.brief_epoch // .dispatched_at_epoch' "$m")"   # codex C3 (iteration 10): disp = delivery, starts the response clock; fresh = the brief's time, keys freshness
+    if [ "$st" = queued ]; then   # brief written at dispatch but the agent was busy: deliver once it settles
+      qs="$(agent_status "$pane")"
+      case "$qs" in
+        idle|done)
+          # I4 modal guard (v1.12.2, defect 5): before delivering a queued brief, check the screen — a
+          # pane that settled into a model picker or permission dialog must not receive panel text
+          # (its input box would eat the brief). Fail closed: re-queue and let the human decide.
+          qmodal="$(printf '%s' "$(pane_screen "$pane")" | screen_modal_class)"
+          if [ -n "$qmodal" ]; then
+            set_state "$panel" queued "delivery deferred: pane is in a $qmodal state (I4) — not clean for text; human decides" "$qmodal"
+            pending=$((pending + 1)); summary+="$panel:queued-modal "; continue
+          fi
+          if herdr agent prompt "$pane" "$(jq -r .pointer "$m")" >/dev/null 2>&1; then
+            reset_mark_used "$(jq -r '.label // ("'"$PANEL_PREFIX"'" + .panel)' "$m")" "$sid" "PANEL TASK $sid"   # v1.12.0: a queued brief delivered here also contaminates the pane for the NEXT session
+            json_set "$m" '.state="dispatched" | .delivered=true | .dispatched_at=$t | .dispatched_at_epoch=$e | .updated=$t' --arg t "$(now_iso)" --argjson e "$(now_epoch)"
+            json_set "$rd/round.json" '.present = ((.present // []) + [$p] | unique)' --arg p "$panel"   # codex C6 (iteration 10): a delivered member was asked — the record says so
+            transcript "$d" "r$round" "$panel → dispatched (queued brief delivered after the agent settled; added to round.json.present)"
+          fi ;;
+        gone|none) set_state "$panel" gone "pane/agent vanished while queued"; continue ;;
+      esac
+      pending=$((pending + 1)); summary+="$panel:queued "; continue
+    fi
+    nudges="$(jq -r .nudges "$m")"; seenw="$(jq -r .seen_working "$m")"
+    ptmo="$(jq -r '.timeout_s // empty' "$m")"; ptmo="${ptmo:-$PANEL_PANEL_TIMEOUT_S}"
+    ans="$rd/in/$panel.md"; now="$(now_epoch)"; elapsed=$((now - disp))
+    have_file=0; [ -s "$ans" ] && [ "$(file_mtime "$ans")" -ge "$fresh" ] && have_file=1
+    status="$(agent_status "$pane")"
+    terminal=0
+    case "$status" in
+      gone)  set_state "$panel" gone "pane_not_found"; terminal=1;;
+      none)  set_state "$panel" gone "no agent in pane (exited?) — panel-heal will restart it next round"; terminal=1;;
+      working|unknown)
+        [ "$seenw" = true ] || json_set "$m" '.seen_working=true'
+        [ "$st" = working ] || { [ "$status" = working ] && set_state "$panel" working; }
+        # a "working" agent may in fact be stuck in a provider retry loop: check the screen for hard provider failures
+        if [ "$elapsed" -ge 30 ]; then
+          classify_pane "$pane" "$panel"
+          # iteration 5 (orchestrator-observed): while the agent is WORKING, its screen is what it reads, not a report about
+          # itself — a panel reviewing this classifier's code showed the phrase list and was marked failed (4 times). A provider
+          # retry loop is static; a reading agent scrolls. Act only when the screen has not changed for PANEL_STUCK_SCREEN_S.
+          # D2-A + U66 (iteration 6): a screen — static or not — is not evidence that a matched phrase is a provider error about THIS
+          # agent (a thinking panel can hold quoted error text for 90 s; a real retry loop can keep changing its screen). While WORKING a
+          # panel is never excluded on screen text: the class is recorded once (meta .screen_note, transcript) and the panel closes only
+          # by its own timeout_s, where the gated classification applies (U65). PANEL_STUCK_SCREEN_S is a debounce for the record.
+          shash="$(sha256sum "$rd/raw/$panel.screen.txt" | cut -c1-16)"
+          if [ "$shash" != "$(jq -r '.screen_sha // ""' "$m")" ]; then json_set "$m" '.screen_sha=$s | .screen_since=$t' --arg s "$shash" --argjson t "$now"; fi
+          stable=$(( now - $(jq -r '.screen_since // 0' "$m") ))
+          if [ "$CLS" != unknown ] && [ "$(jq -r '.screen_note // ""' "$m")" != "$CLS" ]; then
+            json_set "$m" '.screen_note=$c | .screen_note_at=$t' --arg c "$CLS" --argjson t "$now"
+            printf '.. %s: "%s" on its screen while working (static %ss) — recorded, not acted on (D2-A/U66); closes only by its own timeout_s (%ss)\n' "$panel" "$CLS" "$stable" "$ptmo"
+            transcript "$d" "r$round" "$panel: screen class \"$CLS\" while working (static ${stable}s) — recorded, not acted on (D2-A/U66)"
+          fi
+        fi ;;
+      blocked)
+        if [ "$st" != blocked ]; then
+          herdr pane read "$pane" --source visible > "$rd/raw/$panel.blocked.txt" 2>/dev/null || true
+          set_state "$panel" blocked "dialog on screen — human decides; see raw/$panel.blocked.txt" permission-dialog
+          printf '!! %s is BLOCKED on an approval/question dialog. Do not answer it. Show the human %s\n' "$panel" "$rd/raw/$panel.blocked.txt"
+        fi ;;
+      idle|done)
+        if [ "$have_file" = 1 ]; then
+          capture_raw "$pane" "$panel"; mark_answered "$panel" "$m" "$ans" answered; terminal=1
+        elif [ "$elapsed" -ge 20 ]; then
+          # settled without a file: look at the screen to classify why (data, not instructions).
+          # Hard provider failures (usage-limit/auth/context-window) act at once; anything else only earns a reminder —
+          # the panel is closed by its own timeout_s (D4-A), never by a nudge count.
+          classify_pane "$pane" "$panel"
+          reset=""
+          if [ "$CLS" = usage-limit ]; then
+            reset="$(parse_reset_epoch "$HINT")"
+            if [ -n "$reset" ] && [ "$reset" -lt "$now" ]; then
+              if [ $((now - reset)) -lt 21600 ]; then CLS=stale-banner; else reset_hint_dated "$HINT" || reset=$((reset + 86400)); fi   # banner older than its own reset time = stale echo; a dated reset is never day-shifted (D1-B)
+            fi
+          fi
+          case "$CLS" in
+            usage-limit)
+              lbl="$(label_of "$panel")"
+              budget_write "$lbl" usage-limit "$HINT" "$reset" "" "collect:r$round" "$(reset_hint_dated "$HINT" && echo 1 || echo 0)"
+              capture_raw "$pane" "$panel"
+              set_state "$panel" budget-exhausted "provider usage limit${HINT:+: $HINT}${reset:+ (until $(date_fmt "$reset" +%H:%M))}" usage-limit; terminal=1
+              printf '!! %s hit its provider usage limit%s — skipped until reset\n' "$panel" "${HINT:+ ($HINT)}" ;;
+            auth|context-window)
+              capture_raw "$pane" "$panel"; set_state "$panel" failed "$CLS on screen — needs a human (see raw/$panel.screen.txt)" "$CLS"; terminal=1
+              printf '!! %s failed: %s — see %s\n' "$panel" "$CLS" "$rd/raw/$panel.screen.txt" ;;
+            *)
+              maxn=1; [ "$CLS" = transient ] && maxn=2
+              since=$((now - $(jq -r '.nudged_at_epoch // 0' "$m")))
+              if [ "$nudges" -lt "$maxn" ] && { [ "$seenw" = true ] || [ "$elapsed" -ge "$PANEL_NUDGE_AFTER_S" ]; } && { [ "$nudges" -eq 0 ] || [ "$since" -ge "$PANEL_TRANSIENT_RETRY_S" ]; }; then
+                herdr agent prompt "$pane" "REMINDER — $(jq -r .pointer "$m")" >/dev/null 2>&1 || true
+                json_set "$m" '.nudges+=1 | .seen_working=false | .nudged_at_epoch=$t' --argjson t "$now"
+                set_state "$panel" nudged "settled with no answer file after ${elapsed}s (reminder $((nudges + 1))/$maxn); closes at ${ptmo}s unless it answers" "$CLS"
+              fi ;;
+          esac
+        fi ;;
+    esac
+    # U69 (iteration 7, all four panels): the file is the answer; the pane state is a liveness signal. A panel whose answer file is present
+    # but whose agent is still "working" at its own timeout_s is marked answered (unconfirmed by settle) instead of being carried as pending
+    # while panel-matrix counts the file — the two instruments no longer disagree about what an answer is.
+    if [ "$terminal" = 0 ] && [ "$have_file" = 1 ] && [ "$elapsed" -ge "$ptmo" ]; then
+      # D3-B: a quiet file is taken at timeout_s. D2-A (iteration 9, claude C4 → 4/4): a file that never goes quiet was unclosable (matched neither this
+      # branch nor the have_file=0 branch, and the sweep refused it) — now each failed quiescence check is counted in the meta and the file is taken,
+      # marked "not quiet", once timeout_s + PANEL_ROUND_GRACE_S has passed. Bounded wait; the answer is never lost and the round always ends.
+      qn=wait
+      if file_quiet "$ans"; then qn=""
+      elif [ "$elapsed" -ge $((ptmo + PANEL_ROUND_GRACE_S)) ]; then qn=", NOT quiet: still changing at ${elapsed}s after $(jq -r '.quiet_fail // 0' "$m") failed quiescence check(s) — taken at timeout_s + PANEL_ROUND_GRACE_S (${PANEL_ROUND_GRACE_S}s), D2-A"
+      else json_set "$m" '.quiet_fail=((.quiet_fail // 0) + 1)'; printf '.. %s: answer file still changing at %ss (quiescence check failed %s×; taken regardless at %ss — D2-A)\n' "$panel" "$elapsed" "$(jq -r .quiet_fail "$m")" $((ptmo + PANEL_ROUND_GRACE_S)); fi
+      if [ "$qn" != wait ]; then
+        [ -z "$qn" ] || cp "$ans" "$rd/raw/$panel.accepted.md"   # D5-A (iteration 10): the accepted snapshot — the matrix tallies this, not a file that may still be changing
+        capture_raw "$pane" "$panel"; json_set "$m" '.unconfirmed=$u' --arg u "answer file present, agent still $status at its timeout_s (${elapsed}s) — U69: the file is the answer$qn"
+        mark_answered "$panel" "$m" "$ans" answered
+        printf '.. %s: answer file present but agent still %s at %ss — marked answered (file unconfirmed by settle, U69%s)\n' "$panel" "$status" "$elapsed" "${qn:+; NOT quiet, D2-A}"; terminal=1
+      fi
+    fi
+    if [ "$terminal" = 0 ] && [ "$have_file" = 0 ] && [ "$elapsed" -ge "$ptmo" ]; then
+      classify_pane "$pane" "$panel"; capture_raw "$pane" "$panel"
+      # U65 + codex REASONING (iteration 6): the timeout branch applies the same gates as the settled branch — for a still-working agent a
+      # usage-limit class needs a screen that stopped changing (a retry loop is static; a reading agent scrolls), and any reset hint must
+      # not be a stale echo. A provider=local panel was already exempted in classify_pane.
+      if [ "$CLS" = usage-limit ] && { [ "$status" = working ] || [ "$status" = unknown ]; }; then
+        shash="$(sha256sum "$rd/raw/$panel.screen.txt" | cut -c1-16)"
+        if [ "$shash" != "$(jq -r '.screen_sha // ""' "$m")" ]; then json_set "$m" '.screen_sha=$s | .screen_since=$t' --arg s "$shash" --argjson t "$now"; fi
+        stable=$(( now - $(jq -r '.screen_since // 0' "$m") ))
+        [ "$stable" -ge "$PANEL_STUCK_SCREEN_S" ] || CLS=changing-screen
+      fi
+      reset=""
+      if [ "$CLS" = usage-limit ]; then
+        reset="$(parse_reset_epoch "$HINT")"
+        if [ -n "$reset" ] && [ "$reset" -lt "$now" ]; then
+          if [ $((now - reset)) -lt 21600 ]; then CLS=stale-banner; else reset_hint_dated "$HINT" || reset=$((reset + 86400)); fi   # the settled branch's stale-echo test; dated reset never shifted (D1-B)
+        fi
+      fi
+      if [ "$CLS" = usage-limit ]; then
+        lbl="$(label_of "$panel")"; budget_write "$lbl" usage-limit "$HINT" "$reset" "" "collect:r$round-timeout" "$(reset_hint_dated "$HINT" && echo 1 || echo 0)"
+        set_state "$panel" budget-exhausted "timed out (${elapsed}s) with a provider usage limit on a static screen${HINT:+: $HINT}" usage-limit
+      elif [ "$status" = working ] || [ "$status" = unknown ]; then
+        set_state "$panel" timeout "${elapsed}s > ${ptmo}s, still $status" "$CLS"
+      else
+        set_state "$panel" no-response "settled without writing $ans within ${ptmo}s ($nudges reminder(s))" "$CLS"
+      fi
+      terminal=1
+    fi
+    [ "$terminal" = 1 ] || { pending=$((pending + 1)); summary+="$panel:$status "; }
+  done
+
+  # D4-E optional quorum exit: never in blind rounds, never while any panel is working/queued, never before a working panel's timeout
+  if [ "${PANEL_QUORUM_EXIT:-0}" -gt 0 ] && [ "$type" != blind ] && [ "$pending" -gt 0 ]; then
+    if ! jq -s -e 'any(.[]; .state|IN("working","queued"))' "$rd"/meta/*.json >/dev/null; then
+      dispatched_n="$(jq -s '[.[] | select(.state|IN("answered","answered-late","dispatched","nudged","no-response","timeout"))] | length' "$rd"/meta/*.json)"
+      answered_n="$(jq -s '[.[] | select(.state|IN("answered","answered-late"))] | length' "$rd"/meta/*.json)"
+      median="$(jq -s '[.[] | .latency_s // empty] | sort | if length==0 then 0 else .[length/2|floor] end' "$rd"/meta/*.json)"
+      if [ "$dispatched_n" -gt 0 ] && [ $((answered_n * 100 / dispatched_n)) -ge "$PANEL_QUORUM_EXIT" ] && [ "$median" -gt 0 ]; then
+        for m in "$rd"/meta/*.json; do
+          jq -e '.state|IN("dispatched","nudged")' "$m" >/dev/null || continue
+          panel="$(basename "$m" .json)"; el=$(( $(now_epoch) - $(jq -r .dispatched_at_epoch "$m") ))
+          cptmo="$(jq -r '.timeout_s // empty' "$m")"; cptmo="${cptmo:-$PANEL_PANEL_TIMEOUT_S}"   # this candidate's own timeout, not the last loop's (U37)
+          if [ "$el" -gt $((median * 2)) ] && [ "$el" -ge "$cptmo" ]; then set_state "$panel" no-response "quorum exit: ${answered_n}/${dispatched_n} answered, ${el}s > 2×median ${median}s and >= its own timeout_s=${cptmo} (PANEL_QUORUM_EXIT=$PANEL_QUORUM_EXIT); a late file still merges" quorum-exit; pending=$((pending - 1)); fi
+        done
+      fi
+    fi
+  fi
+  answered="$(jq -s '[.[] | select(.state|IN("answered","answered-late"))] | length' "$rd"/meta/*.json)"
+  total="$(ls "$rd"/meta/*.json | wc -l | tr -d ' ')"
+  printf '[collect r%s %s +%ss] answered %s/%s pending %s %s\n' "$round" "$type" "$(( $(now_epoch) - start ))" "$answered" "$total" "$pending" "${summary:+· $summary}"
+  [ "$pending" -eq 0 ] && break
+  if [ -n "$waitfor" ]; then  # stop early once the named panels are terminal
+    still=0; for w in ${waitfor//,/ }; do jq -e '.state|IN("queued","dispatched","nudged","working","blocked")' "$rd/meta/$w.json" >/dev/null 2>&1 && still=1; done
+    [ "$still" = 0 ] && { warn "--wait-for panels are terminal; $pending other(s) still pending"; break; }
+  fi
+  [ "$once" = 1 ] && break
+  if [ "$(now_epoch)" -ge "$deadline" ]; then   # agy C7 (iteration 8, seconded): the sweep's answers leave the pending count, so a fully swept round exits 0, not 3
+    unconfirmed_sweep; pending=$((pending - SWEPT)); answered=$((answered + SWEPT))
+    [ "$pending" -gt 0 ] && warn "collect window ($timeout s) over with $pending pending — re-run panel-collect to continue"; break
+  fi
+  sleep "$poll"
+done
+
+jq -s --argjson round "$round" --arg t "$(now_iso)" --argjson dur "$(( $(now_epoch) - start ))" '{round:$round, at:$t, collect_seconds:$dur,
+  answered:[.[]|select(.state=="answered")|.panel], answered_late:[.[]|select(.state=="answered-late")|.panel],
+  answered_unconfirmed:[.[]|select(.state=="answered" and (.unconfirmed//null)!=null)|.panel],
+  no_response:[.[]|select(.state=="no-response")|.panel],
+  timeout:[.[]|select(.state=="timeout")|.panel], gone:[.[]|select(.state=="gone")|.panel],
+  budget_exhausted:[.[]|select(.state=="budget-exhausted")|.panel], failed:[.[]|select(.state=="failed")|.panel],
+  skipped:[.[]|select(.state=="skipped")|.panel], blocked:[.[]|select(.state=="blocked")|.panel],
+  pending:[.[]|select(.state|IN("queued","dispatched","nudged","working","blocked"))|.panel],
+  answered_post_consensus:[.[]|select(.state=="answered-post-consensus")|.panel],
+  panels:(map({(.panel): {state, reason_class, latency_s:(.latency_s//null), answer_bytes:(.answer_bytes//null), dispatch_bytes:(.dispatch_bytes//null), nudges, timeout_s:(.timeout_s//null)}}) | add),
+  round_latency_s:([.[]|.latency_s//empty]|max)}' "$rd"/meta/*.json > "$rd/collect.json"
+if [ "$pending" -gt 0 ]; then printf 'NEXT: %s/panel-collect %s %s   (re-arm: run again until it exits 0/1)\n' "$(dirname "$0")" "$d" "$round"; exit 3; fi
+if [ "$(jq -r .state "$d/session.json")" = ratified ] || [ -s "$d/consensus.md" ]; then transcript "$d" "r$round" "collect after ratification: session state untouched (U29)"   # U29
+else session_state "$d" "r$round-$type-collected"; fi
+[ "$answered" -gt 0 ] || { warn "zero answers in round $round"; exit 1; }
+printf 'round %s collected: %s answers (slowest %ss).\nNEXT: %s/panel-matrix %s %s\n' "$round" "$answered" "$(jq -r '.round_latency_s // 0' "$rd/collect.json")" "$(dirname "$0")" "$d" "$round"

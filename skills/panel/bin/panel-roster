@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# panel-roster — discover panel panes in the current Herdr workspace.
+# A panel = any pane whose label starts with $PANEL_PREFIX (default "panel-"),
+# excluding the pane this script runs in (the orchestrator, $HERDR_PANE_ID).
+# Enriched from the manifest (provider, timeout_s) and the budget state (budget gate).
+# dispatchable = agent present AND settled (idle|done) AND budget gate ok. Sorted slow-first (timeout desc).
+# Isolation (v1.12.0): with --session/--write the per-pane context-reset state is read too. A pane that a
+# previous panel session used and whose reset was not VERIFIED is `clean=unclean` and NOT dispatchable —
+# a reused pane never receives round-1 work with the previous task's conversation still in context.
+# Usage: panel-roster [--write <session>] [--session <dir>] [--table]
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+write=""; table=0; sess_arg=""
+while [ $# -gt 0 ]; do case "$1" in
+  --write) write="$(resolve_session "$2")"; shift 2;;
+  --session) sess_arg="$(resolve_session "$2")"; shift 2;;
+  --table) table=1; shift;;
+  -h|--help) sed -n '2,7p' "$0"; exit 0;;
+  *) die "unknown arg: $1";;
+esac; done
+
+base="$(herdr pane list --workspace "$HERDR_WORKSPACE_ID" \
+  | jq --arg self "$HERDR_PANE_ID" --arg prefix "$PANEL_PREFIX" '
+    [ .result.panes[]
+      | select(.pane_id != $self)
+      | select((.label // "") | startswith($prefix))
+      | { panel: (.label | ltrimstr($prefix)), label: .label, pane_id: .pane_id,
+          kind: (.agent // null), status: (.agent_status // "none"), cwd: .cwd,
+          settled: ((.agent != null) and ((.agent_status // "") | IN("idle","done"))) } ]')"
+
+sid_ctx=""
+for _s in "$write" "$sess_arg"; do [ -n "$_s" ] && [ -s "$_s/session.json" ] && sid_ctx="$(jq -r '.session_id // empty' "$_s/session.json")" && break; done
+
+# enrich per panel: provider/timeout from manifest, budget gate from state, isolation from reset state
+enriched="[]"
+while IFS=$'\t' read -r label; do
+  provider="$(manifest_get "$label" '.provider' unknown)"
+  tmo="$(manifest_get "$label" '.timeout_s' "$PANEL_PANEL_TIMEOUT_S")"
+  IFS=$'\t' read -r gate reason < <(budget_check "$label")
+  IFS=$'\t' read -r clean creason < <(reset_check "$label" "$sid_ctx")
+  enriched="$(printf '%s' "$enriched" | jq --arg l "$label" --arg p "$provider" --argjson t "$tmo" --arg g "$gate" --arg r "$reason" --arg c "$clean" --arg cr "$creason" \
+    '. + [{label:$l, provider:$p, timeout_s:$t, budget:$g, budget_reason:$r, clean:$c, clean_reason:$cr,
+           reset_attempted:'"$(reset_state_get "$label" '.reset_attempted' false)"', reset_verified:'"$(reset_state_get "$label" '.reset_verified' false)"',
+           reset_at:"'"$(reset_state_get "$label" '.reset_at' '')"'", in_manifest:'"$(manifest_has "$label" && echo true || echo false)"'}]')"
+done < <(printf '%s' "$base" | jq -r '.[].label')
+
+roster="$(jq -n --argjson b "$base" --argjson e "$enriched" --arg req "${PANEL_REQUIRE_CLEAN:-0}" --arg self "$HERDR_PANE_ID" --arg ws "$HERDR_WORKSPACE_ID" --arg ts "$(now_iso)" '
+  ($e | map({(.label): .}) | add // {}) as $x |
+  { discovered_at: $ts, workspace: $ws, orchestrator_pane: $self,
+    panels: ($b | map(. + ($x[.label] // {}) | .dispatchable = (.settled and (.budget != "skip") and (.clean != "unclean") and ($req != "1" or .clean == "clean"))) | sort_by(-.timeout_s, .panel)) }')"
+
+if [ -n "$write" ]; then
+  printf '%s\n' "$roster" > "$write/roster.json"
+  transcript "$write" roster "$(printf '%s' "$roster" | jq -r '.panels | length') panels, $(printf '%s' "$roster" | jq -r '[.panels[] | select(.dispatchable)] | length') dispatchable"
+fi
+if [ "$table" = 1 ]; then
+  printf '%-30s %-7s %-9s %-14s %-8s %-6s %-7s %-8s %s\n' PANEL PANE KIND PROVIDER STATUS BUDGET CLEAN TIMEOUT READY
+  printf '%s\n' "$roster" | jq -r '.panels[] | [.panel, .pane_id, (.kind // "-"), .provider, .status, .budget, (.clean // "?"), (.timeout_s|tostring), (if .dispatchable then "yes" else "SKIP" end), (if .dispatchable then "" else (if (.settled|not) then "agent "+.status elif (.budget == "skip") then .budget_reason elif (.clean != "clean") then "isolation "+(.clean // "?")+": "+(.clean_reason // "") else .budget_reason end) end)] | @tsv' \
+    | awk -F'\t' '{printf "%-30s %-7s %-9s %-14s %-8s %-6s %-7s %-8s %s %s\n",$1,$2,$3,$4,$5,$6,$7,$8,$9,$10}'
+else
+  printf '%s\n' "$roster"
+fi

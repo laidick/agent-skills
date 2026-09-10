@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# panel-manifest — the per-workspace panel manifest ($PANEL_MANIFEST; default under $HOME/.local/state/agent-skills/panel/, override via ~/.config/agent-skills/panel.env).
+# It is what panel-heal uses to bring a panel back (kind, launch args, cwd) and what panel-budget uses
+# to know the provider and usage window. Captured from live panes, then hand-edited (model/effort/thinking
+# are often not visible on the command line — fill them in).
+# Usage: panel-manifest capture [--force]   merge live panel-* panes into the manifest (keeps your edits)
+#        panel-manifest show               table
+#        panel-manifest validate           schema check
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+cmd="${1:-show}"; shift || true
+case "$cmd" in
+capture)
+  require_herdr
+  force=0; [ "${1:-}" = --force ] && force=1
+  mkdir -p "$(dirname "$PANEL_MANIFEST")"
+  [ -f "$PANEL_MANIFEST" ] || printf '{"version":1,"workspace":"%s","panels":{}}\n' "$HERDR_WORKSPACE_ID" > "$PANEL_MANIFEST"
+  n=0
+  while IFS=$'\t' read -r label pane kind cwd; do
+    argv="$(herdr pane process-info --pane "$pane" 2>/dev/null | jq -c '.result.process_info.foreground_processes[0].argv // []')"
+    case "$kind" in
+      claude) provider=anthropic-sub; probe="/usage"; window="5h";;
+      codex) provider=openai-sub; probe="/status"; window="5h";;
+      gemini|agy) provider=google-sub; probe="/stats"; window="24h";;
+      opencode) provider=opencode-go; probe=""; window="";;
+      pi) provider=local; probe=""; window="";;
+      hermes) provider=unknown; probe=""; window="";;
+      *) provider=unknown; probe=""; window="";;
+    esac
+    [ "$provider" = local ] && tmo=1500 || tmo=600
+    entry="$(jq -n --arg k "$kind" --arg p "$provider" --argjson a "$argv" --arg c "$cwd" --argjson t "$tmo" --arg pr "$probe" --arg w "$window" --arg ts "$(now_iso)" \
+      '{kind:$k, provider:$p, start:$a, cwd:$c, model:null, effort:null, thinking:null, timeout_s:$t,
+        usage:(if $pr=="" then null else {probe:$pr, window:$w} end), captured_at:$ts, notes:"edit model/effort/thinking by hand"}')"
+    if [ "$force" = 0 ] && jq -e --arg l "$label" '.panels[$l] != null' "$PANEL_MANIFEST" >/dev/null; then
+      # keep human edits: only refresh start/cwd/kind if they were null
+      json_set "$PANEL_MANIFEST" '.panels[$l] |= (. + {kind:(.kind // $e.kind), start:(if (.start|length)==0 then $e.start else .start end), cwd:(.cwd // $e.cwd), provider:(.provider // $e.provider), timeout_s:(.timeout_s // $e.timeout_s), usage:(.usage // $e.usage), last_seen:$e.captured_at})' --arg l "$label" --argjson e "$entry"
+    else
+      json_set "$PANEL_MANIFEST" '.panels[$l] = $e' --arg l "$label" --argjson e "$entry"
+    fi
+    n=$((n + 1))
+  done < <(herdr pane list --workspace "$HERDR_WORKSPACE_ID" | jq -r --arg self "$HERDR_PANE_ID" --arg prefix "$PANEL_PREFIX" \
+      '.result.panes[] | select(.pane_id != $self) | select((.label // "") | startswith($prefix)) | [.label, .pane_id, (.agent // "unknown"), .cwd] | @tsv')
+  printf 'manifest: %s panels captured into %s\n' "$n" "$PANEL_MANIFEST"
+  "$0" show ;;
+show)
+  [ -f "$PANEL_MANIFEST" ] || die "no manifest at $PANEL_MANIFEST (run: panel-manifest capture)"
+  printf '%-32s %-9s %-14s %-8s %-22s %-8s %s\n' LABEL KIND PROVIDER TIMEOUT MODEL/EFFORT/THINK PROBE START
+  jq -r '.panels | to_entries[] | [.key, .value.kind, .value.provider, (.value.timeout_s|tostring), ((.value.model//"-")+"/"+(.value.effort//"-")+"/"+(.value.thinking//"-")), (.value.usage.probe // "-"), (.value.start|join(" "))] | @tsv' "$PANEL_MANIFEST" \
+    | awk -F'\t' '{printf "%-32s %-9s %-14s %-8s %-22s %-8s %s\n",$1,$2,$3,$4,$5,$6,$7}' ;;
+validate)
+  [ -f "$PANEL_MANIFEST" ] || die "no manifest"
+  jq -e 'all(.panels|to_entries[]; (.key|startswith("panel-")) and (.value.kind|type=="string") and (.value.start|type=="array") and (.value.cwd|type=="string") and (.value.timeout_s|type=="number"))' "$PANEL_MANIFEST" >/dev/null && echo "manifest ok: $(jq '.panels|length' "$PANEL_MANIFEST") panels" ;;
+*) die "usage: panel-manifest capture [--force] | show | validate";;
+esac

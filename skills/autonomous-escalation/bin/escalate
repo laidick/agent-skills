@@ -1,0 +1,537 @@
+#!/usr/bin/env bash
+# escalate — autonomous-escalation skill CLI (Workstream B, ratified 2026-09-07).
+#
+# A long-running implementation agent uses this to:
+#   * log distinct debugging attempts and let the event-driven trigger
+#     state machine decide when it is genuinely stuck,
+#   * classify a block (implementation/debug, architecture PANEL, external
+#     research, human authorization),
+#   * build a bounded, redacted help packet,
+#   * record the answer (advisory vs authoritative vs human authorization),
+#   * resume the original goal with stale-advice detection.
+#
+# It is NOT a scheduler: it never picks agents/panels or spends subscription
+# budget. It emits a class request; Hermes (or the visible panel skill, for
+# the ARCHITECTURE class) owns scheduling, budget and execution.
+#
+# State lives under $ESCALATE_ROOT/.pi/  (default: $PWD/.pi):
+#   .pi/goal-state.md         human-readable durable goal/progress state
+#   .pi/help/<id>.md          bounded outgoing help packet
+#   .pi/escalations/<id>.md   append-only durable escalation record
+#   .pi/escalations/state.json  machine state for the trigger machine + guards
+#
+# Exit codes: 0 ok · 2 usage · 10 duplicate-suppressed · 11 cooldown ·
+#   12 max-depth · 13 budget exhausted (-> HUMAN_FALLBACK) · 20 answer
+#   rejected (class/authority mismatch) · 40 recorded but STALE.
+set -u
+BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
+. "$BIN_DIR/escalate-lib.sh"
+
+usage() {
+  cat <<'EOF'
+escalate — bounded autonomous escalation (see SKILL.md)
+
+  escalate init --goal "..." [--set key=value]...
+  escalate attempt --hypothesis H --action A --result fail|pass
+                 [--progress "what improved"]
+  escalate event --kind deviation|design-conflict|external-conflict|current-fact|
+                         destructive|credentials|irreversible|security-auth|human-required
+                 --note "..."
+  escalate classify                      # print current class
+  escalate packet --question "..." [--class C] [--decision-type T] [--depth N]
+  escalate answer <id> --kind advisory|authoritative|external-evidence|human-authorization
+                      [--panel-session DIR] [--panel-snapshot-sha SHA] [--panel-outcome LABEL]
+                      [--text "..."]
+  escalate baseline --file PATH          # pin a frozen-design file as baseline
+  escalate resume                        # print resume directive; back to NORMAL
+  escalate status                        # state machine + guard summary
+  escalate help
+EOF
+  exit "$ESC_E_USAGE"
+}
+
+[ $# -ge 1 ] || usage
+cmd="$1"; shift
+
+# ---------------------------------------------------------------- init
+cmd_init() {
+  local goal="" keyval k v
+  declare -A SETS=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --goal) goal="$2"; shift 2 ;;
+      --set) keyval="$2"; shift 2
+        k="${keyval%%=*}"; v="${keyval#*=}"
+        [ "$k" != "$keyval" ] || esc_die "init: --set expects key=value, got: $keyval"
+        case "$k" in
+          min_distinct_attempts|no_progress_cycles|cooldown_attempts|max_depth|max_escalations_per_goal|repeated_unhelpful|packet_max_bytes) ;;
+          *) esc_die "init: unknown config key: $k" ;;
+        esac
+        case "$v" in ''|*[!0-9]*) esc_die "init: config value must be a non-negative integer: $v";; esac
+        SETS["$k"]="$v" ;;
+      *) esc_die "init: unknown arg: $1" ;;
+    esac
+  done
+  [ -n "$goal" ] || esc_die "init: --goal required"
+  mkdir -p "$ESC_HELP_DIR" "$ESC_ESC_DIR"
+  if [ -f "$ESC_STATE" ]; then esc_die "refusing to clobber existing state at $ESC_STATE (remove it to re-init)"; fi
+  local sets_json="{}" kk
+  for kk in "${!SETS[@]}"; do
+    sets_json="$(jq --arg k "$kk" --arg v "${SETS[$kk]}" '. + {($k): ($v|tonumber)}' <<<"$sets_json")"
+  done
+  jq -n --arg goal "$goal" --arg now "$(esc_now)" --argjson sets "$sets_json" '{
+    version: 1,
+    goal: $goal,
+    created: $now,
+    state: "NORMAL",
+    config: ({
+      min_distinct_attempts: 3,
+      no_progress_cycles: 2,
+      cooldown_attempts: 1,
+      max_depth: 1,
+      max_escalations_per_goal: 5,
+      repeated_unhelpful: 2,
+      packet_max_bytes: 16384
+    } + $sets),
+    attempts: [],
+    fail_streak: 0,
+    no_progress_streak: 0,
+    oscillations: 0,
+    events: [],
+    escalations: [],
+    questions: {},
+    baseline_ref: "nogit",
+    baseline_path: null,
+    authorization: null
+  }' > "$ESC_STATE"
+  esc_current_baseline > /dev/null # populate default
+  esc_state_set ".baseline_ref = $(jq -Rs '@text' <<<"$(esc_current_baseline)")"
+  printf '# GOAL STATE (managed by autonomous-escalation skill)\n' > "$ESC_GOAL_STATE"
+  echo
+  echo '## Escalation log'
+  echo
+  echo '## Notes'
+  printf '\ninit ok — state at %s\n' "$ESC_STATE"
+}
+
+# ------------------------------------------------------------- attempt
+cmd_attempt() {
+  local hypothesis="" action="" result="" progress=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --hypothesis) hypothesis="$2"; shift 2 ;;
+      --action) action="$2"; shift 2 ;;
+      --result) result="$2"; shift 2 ;;
+      --progress) progress="$2"; shift 2 ;;
+      *) esc_die "attempt: unknown arg: $1" ;;
+    esac
+  done
+  esc_require_state
+  [ -n "$hypothesis" ] && [ -n "$action" ] && [ -n "$result" ] || esc_die "attempt: --hypothesis, --action, --result required"
+  case "$result" in fail|pass) ;; *) esc_die "attempt: --result must be fail|pass";; esac
+
+  local goal sig
+  goal="$(esc_state_get '.goal')"
+  sig="$(esc_sha_str "$goal|$hypothesis|$action")"
+  local sig_seen
+  sig_seen="$(esc_state_q --arg s "$sig" '[.attempts[] | select(.sig == $s)] | length')"
+  local ts; ts="$(esc_now)"
+
+  if [ "$sig_seen" -gt 0 ]; then
+    # REPEAT: same (hypothesis, action) already counted. Not a distinct attempt.
+    # (Re-running the same command/patch, restating a hypothesis: no new count.)
+    local total_for_sig
+    total_for_sig="$sig_seen"
+    esc_state_set ".attempts += [{sig:\"$sig\", hypothesis:$(esc_json "$hypothesis"), action:$(esc_json "$action"), result:\"$result\", ts:\"$ts\", repeat:true}]"
+    # oscillation: same (hypothesis,action) tried 3+ times = 2+ edit/revert loops
+    if [ "$total_for_sig" -ge 2 ]; then
+      esc_state_set '.oscillations += 1'
+    fi
+    printf 'REPEAT — not counted as a distinct attempt (sig=%s, attempts-with-sig=%s)\n' "$sig" "$((total_for_sig+1))"
+  else
+    local fail_np
+    if [ "$result" = pass ]; then
+      esc_state_set ".attempts += [{sig:\"$sig\", hypothesis:$(esc_json "$hypothesis"), action:$(esc_json "$action"), result:\"pass\", ts:\"$ts\", repeat:false}] | .fail_streak = 0 | .no_progress_streak = 0"
+      esc_state_set '.escalations |= map(if .status == "answered" and .helpful == false then .helpful = true else . end)'
+      printf 'ATTEMPT distinct (pass) — streaks reset\n'
+    elif [ -n "$progress" ]; then
+      # measurable progress: observable improved toward the goal
+      local pm; pm="$(esc_json "$ts progress: $progress")"
+      esc_state_set ".attempts += [{sig:\"$sig\", hypothesis:$(esc_json "$hypothesis"), action:$(esc_json "$action"), result:\"fail\", ts:\"$ts\", repeat:false}] | .fail_streak = 0 | .no_progress_streak = 0 | .last_progress_marker = $pm"
+      esc_state_set '.escalations |= map(if .status == "answered" and .helpful == false then .helpful = true else . end)'
+      printf 'ATTEMPT distinct (fail, WITH MEASURABLE PROGRESS: %s) — streaks reset\n' "$progress"
+    else
+      esc_state_set ".attempts += [{sig:\"$sig\", hypothesis:$(esc_json "$hypothesis"), action:$(esc_json "$action"), result:\"fail\", ts:\"$ts\", repeat:false}] | .fail_streak += 1 | .no_progress_streak += 1"
+      printf 'ATTEMPT distinct (fail, no progress)\n'
+    fi
+  fi
+
+  # Trigger evaluation — event-driven only; wall-clock is never a trigger.
+  local fs np osc min_a min_p
+  fs="$(esc_state_get '.fail_streak')"; np="$(esc_state_get '.no_progress_streak')"
+  osc="$(esc_state_get '.oscillations')"
+  min_a="$(esc_state_get '.config.min_distinct_attempts')"; min_p="$(esc_state_get '.config.no_progress_cycles')"
+  local trigger="none"
+  if [ "$fs" -ge "$min_a" ]; then trigger="distinct-attempts"
+  elif [ "$np" -ge "$min_p" ]; then trigger="no-progress"
+  elif [ "$osc" -ge 2 ]; then trigger="oscillation"; fi
+  if [ "$trigger" != none ]; then
+    esc_state_set '.state = "STALLED" | .last_trigger = "'$trigger'"'
+    esc_render_goal_state
+    printf 'STATE=STALLED TRIGGER=%s (fail_streak=%s/%s no_progress=%s/%s oscillations=%s)\n' \
+      "$trigger" "$fs" "$min_a" "$np" "$min_p" "$osc"
+    esc_render_goal_state > /dev/null
+    return 30
+  fi
+  esc_render_goal_state
+  printf 'STATE=NORMAL trigger=none (fail_streak=%s/%s no_progress=%s/%s)\n' "$fs" "$min_a" "$np" "$min_p"
+  return 0
+}
+
+# ---------------------------------------------------------------- event
+cmd_event() {
+  local kind="" note=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind) kind="$2"; shift 2 ;;
+      --note) note="$2"; shift 2 ;;
+      *) esc_die "event: unknown arg: $1" ;;
+    esac
+  done
+  esc_require_state
+  [ -n "$kind" ] || esc_die "event: --kind required"
+  case "$kind" in
+    deviation|design-conflict|architecture|external-conflict|current-fact|external|destructive|credentials|irreversible|security-auth|human-required) ;;
+    *) esc_die "event: unknown kind: $kind" ;;
+  esac
+  local cls; cls="$(esc_class_from_events_kind "$kind")"
+  esc_state_set ".events += [{kind:\"$kind\", note:$(esc_json "$note"), ts:\"$(esc_now)\", class:\"$cls\"}] | .state = \"STALLED\""
+  esc_render_goal_state
+  printf 'EVENT class=%s — immediate escalation (no attempt-count threshold applies to governance events)\n' "$cls"
+  return 30
+}
+
+# ------------------------------------------------------------ classify
+cmd_classify() {
+  esc_require_state
+  esc_class_from_events
+}
+
+# --------------------------------------------------------------- packet
+cmd_packet() {
+  local question="" class="" dtype="" depth=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --question) question="$2"; shift 2 ;;
+      --class) class="$2"; shift 2 ;;
+      --decision-type) dtype="$2"; shift 2 ;;
+      --depth) depth="$2"; shift 2 ;;
+      *) esc_die "packet: unknown arg: $1" ;;
+    esac
+  done
+  esc_require_state
+  [ -n "$question" ] || esc_die "packet: --question required"
+  [ "$depth" -ge 0 ] 2>/dev/null || esc_die "packet: --depth must be an integer"
+  [ -n "$class" ] || class="$(esc_class_from_events)"
+  case "$class" in IMPLEMENTATION/DEBUG|ARCHITECTURE/PANEL|EXTERNAL/RESEARCH|HUMAN) ;; *) esc_die "packet: unknown class: $class";; esac
+  [ -n "$dtype" ] || case "$class" in
+    IMPLEMENTATION/DEBUG) dtype="advisory-hint" ;;
+    ARCHITECTURE/PANEL)   dtype="authoritative-architecture" ;;
+    EXTERNAL/RESEARCH)    dtype="external-fact" ;;
+    HUMAN)                dtype="yes-no-authorization" ;;
+  esac
+
+  # ---- guard 1: per-goal budget -------------------------------------
+  local used max_budget
+  used="$(esc_state_get '.escalations | length')"; max_budget="$(esc_state_get '.config.max_escalations_per_goal')"
+  if [ "$used" -ge "$max_budget" ]; then
+    esc_state_set '.state = "HUMAN_FALLBACK"'
+    esc_render_goal_state
+    printf 'HUMAN_FALLBACK — per-goal escalation budget exhausted (%s/%s). Present the full packet to a HUMAN; no further fan-out.\n' "$used" "$max_budget"
+    return "$ESC_E_BUDGET"
+  fi
+
+  # ---- guard 2: depth (anti fan-out) ----------------------------------
+  local max_depth; max_depth="$(esc_state_get '.config.max_depth')"
+  if [ "$depth" -ge "$max_depth" ] && [ "$class" != "HUMAN" ]; then
+    printf 'MAX-DEPTH — depth %s >= %s. A reviewer at depth %s must NOT spawn another %s; route to HUMAN.\n' "$depth" "$max_depth" "$depth" "$class"
+    return "$ESC_E_DEPTH"
+  fi
+
+  # ---- question hash + dedup / cooldown / step-up ----------------------
+  local goal fsig qh
+  goal="$(esc_state_get '.goal')"
+  fsig="$(esc_state_get '.failure_signature // empty')"
+  [ -n "$fsig" ] || fsig="$(esc_sha_str "attempts:$(esc_state_get '[.attempts[] | .result] | length')" )"
+  esc_state_set ".failure_signature = $(jq -Rs '@text' <<<"$fsig")"
+  qh="$(esc_sha_str "$goal|$fsig|$question")"
+  attempts_now="$(esc_state_get '[.attempts[] | select(.repeat == false)] | length')"
+  local prior; prior="$(esc_state_q --arg h "$qh" '.questions[$h] // empty')"
+  if [ -n "$prior" ]; then
+    local pclass pcount pstate since
+    pclass="$(printf '%s' "$prior" | jq -r '.class')"
+    pcount="$(printf '%s' "$prior" | jq -r '.count_at')"
+    pstate="$(printf '%s' "$prior" | jq -r '.state')"
+    since=$((attempts_now - pcount))
+    local cooldown; cooldown="$(esc_state_get '.config.cooldown_attempts')"
+    if [ "$pstate" = "pending" ]; then
+      printf 'DUPLICATE — question %s already has a pending escalation (%s). Do not re-send.\n' "${qh:0:12}" "$pclass"
+      return "$ESC_E_DUP"
+    fi
+    if [ "$since" -lt "$cooldown" ]; then
+      printf 'COOLDOWN — only %s new distinct attempt(s) since last escalation of this question (need %s). One full re-attempt cycle before re-escalating.\n' "$since" "$cooldown"
+      return "$ESC_E_COOLDOWN"
+    fi
+    # repeated-unhelpful step-up: never re-escalate an unhelpful class at the same level
+    if [ "$pstate" = "answered" ]; then
+      local p_helpful unhelpful_run
+      p_helpful="$(printf '%s' "$prior" | jq -r '.helpful')"
+      unhelpful_run="$(esc_state_q --arg h "$qh" --arg c "$pclass" '
+        [ .escalations[] | select(.question_hash == $h and .class == $c and .helpful == false) ] | length')"
+      local ru; ru="$(esc_state_get '.config.repeated_unhelpful')"
+      if [ "$p_helpful" = false ] && [ "$unhelpful_run" -ge "$ru" ]; then
+        local req_class; req_class="$(esc_class_up "$pclass")"
+        local lvl_req lvl_want
+        lvl_req="$(esc_class_level "$req_class")"; lvl_want="$(esc_class_level "$class")"
+        if [ "$lvl_want" -lt "$lvl_req" ]; then
+          printf 'DUPLICATE — class %s already failed %s time(s) without measurable progress for this question. Re-escalate at %s (ladder never retries the same class).\n' "$pclass" "$unhelpful_run" "$req_class"
+          return "$ESC_E_DUP"
+        fi
+        printf 'STEP-UP — %s failed without progress; this packet is at the next ladder class %s.\n' "$pclass" "$class"
+      fi
+    fi
+  fi
+
+  # ---- build bounded, redacted packet ----------------------------------
+  local id seq esc_path help_path
+  seq=$((used + 1))
+  id="esc-$(printf %03d "$seq")"
+  help_path="$ESC_HELP_DIR/$id.md"
+  esc_path="$ESC_ESC_DIR/$id.md"
+  local bl_ref; bl_ref="$(esc_current_baseline)"
+  local max_bytes; max_bytes="$(esc_state_get '.config.packet_max_bytes')"
+  local gstatus gitdiff
+  if git -C "$ESC_ROOT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    gstatus="$(git -C "$ESC_ROOT" status --porcelain | esc_bound 30 | esc_redact)"
+    gitdiff="$(git -C "$ESC_ROOT" diff --stat | esc_bound 30 | esc_redact)"
+  else
+    gstatus="(not a git repository)"
+    gitdiff="(not a git repository)"
+  fi
+  local goal_excerpt
+  goal_excerpt="$(esc_bound 25 "$ESC_GOAL_STATE" 2>/dev/null | esc_redact)"
+  {
+    printf '# HELP PACKET %s\n' "$id"
+    printf '%s\n' "- goal: $goal"
+    printf '%s\n' "- exact_question: $(printf '%s' "$question" | esc_redact)"
+    printf '%s\n' "- escalation_class: $class"
+    printf '%s\n' "- requested_decision_type: $dtype"
+    printf '%s\n' "- question_hash: $qh"
+    printf '%s\n' "- baseline_ref: $bl_ref"
+    printf '%s\n' "- failure_signature: $fsig"
+    printf '%s\n\n' "- created: $(esc_now)"
+    printf '## Goal-state excerpt\n\n%s\n\n' "$goal_excerpt"
+    printf '## Frozen design reference\n\n%s\n\n' "$(esc_state_get '.baseline_path // "(none pinned — see baseline_ref)"')"
+    printf '## git status\n\n%s\n\n' "$gstatus"
+    printf '## Changed files (diff --stat)\n\n%s\n\n' "$gitdiff"
+    printf '## Attempts (hypothesis / action / result)\n\n'
+    esc_state_get -r '.attempts[] | "- " + .hypothesis + " | " + .action + " | " + .result + (if .repeat then " (repeat)" else "" end)' | esc_redact
+    echo
+    printf '## Requested decision\n\n%s\n' "$dtype"
+  } > "$help_path"
+  # bounded: enforce byte cap with a truncation note (never silently)
+  if [ "$(wc -c < "$help_path")" -gt "$max_bytes" ]; then
+    head -c "$max_bytes" "$help_path" > "$help_path.tmp"
+    printf '\n… [TRUNCATED to %s bytes — see %s for the full bounded record]\n' "$max_bytes" "$esc_path" >> "$help_path.tmp"
+    mv "$help_path.tmp" "$help_path"
+  fi
+
+  # ---- durable escalation record (append-only, self-contained) --------
+  {
+    printf '# ESCALATION %s — %s\n\n' "$id" "$class"
+    printf 'status: pending\n'
+    printf 'question_hash: %s\n' "$qh"
+    printf 'baseline_ref: %s\n' "$bl_ref"
+    printf 'decision_type: %s\n' "$dtype"
+    printf 'created: %s\n\n' "$(esc_now)"
+    printf '---\n\n'
+    esc_redact < "$help_path"
+  } > "$esc_path"
+
+  esc_state_set ".escalations += [{id:\"$id\", question_hash:\"$qh\", class:\"$class\", decision_type:\"$dtype\", count_at:$attempts_now, baseline_ref:\"$bl_ref\", status:\"pending\", helpful:false, stale:false, ts:\"$(esc_now)\"}] | .state = \"AWAITING\" | .questions[\"$qh\"] = {class:\"$class\", count_at:$attempts_now, state:\"pending\", helpful:false}"
+  esc_render_goal_state
+  printf 'PACKET=%s\n' "$help_path"
+  printf 'RECORD=%s\n' "$esc_path"
+  printf 'ID=%s CLASS=%s\n' "$id" "$class"
+  return 0
+}
+
+# --------------------------------------------------------------- answer
+cmd_answer() {
+  local id="" kind="" psession="" psha="" poutcome="" text=""
+  [ $# -ge 1 ] || esc_die "answer: <id> required"
+  id="$1"; shift
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --kind) kind="$2"; shift 2 ;;
+      --panel-session) psession="$2"; shift 2 ;;
+      --panel-snapshot-sha) psha="$2"; shift 2 ;;
+      --panel-outcome) poutcome="$2"; shift 2 ;;
+      --text) text="$2"; shift 2 ;;
+      *) esc_die "answer: unknown arg: $1" ;;
+    esac
+  done
+  esc_require_state
+  [ -n "$kind" ] || esc_die "answer: --kind required"
+  local esc_path="$ESC_ESC_DIR/$id.md"
+  [ -f "$esc_path" ] || esc_die "answer: no escalation record $esc_path"
+  local class; class="$(esc_state_q --arg i "$id" '[.escalations[] | select(.id == $i)] | length as $n | if $n == 1 then (.[0].class) else "" end')"
+  [ -n "$class" ] || esc_die "answer: id $id not found in state"
+
+  # ---- authority rules (ratified): a reviewer can NEVER be authoritative
+  case "$kind" in
+    advisory)
+      case "$class" in IMPLEMENTATION/DEBUG) ;; *) esc_die "REJECTED — kind=advisory only valid for IMPLEMENTATION/DEBUG (got $class)";; esac ;;
+    external-evidence)
+      case "$class" in EXTERNAL/RESEARCH) ;; *) esc_die "REJECTED — kind=external-evidence only valid for EXTERNAL/RESEARCH (got $class)";; esac ;;
+    authoritative)
+      case "$class" in
+        ARCHITECTURE/PANEL)
+          [ -n "$psession" ] && [ -n "$psha" ] || esc_die "REJECTED — authoritative requires --panel-session and --panel-snapshot-sha (visible panel evidence)"
+          [ -d "$psession" ] || esc_die "REJECTED — panel session dir not found: $psession"
+          [ -f "$psession/consensus.md" ] || esc_die "REJECTED — no consensus.md in panel session (not a terminal ratified result)"
+          ;;
+        *) esc_die "REJECTED — kind=authoritative only valid for ARCHITECTURE/PANEL with visible panel evidence (got $class)" ;;
+      esac ;;
+    human-authorization)
+      case "$class" in HUMAN) ;; *) esc_die "REJECTED — kind=human-authorization only valid for class HUMAN (got $class)";; esac ;;
+    *) esc_die "answer: unknown kind: $kind" ;;
+  esac
+
+  # ---- stale detection: underlying baseline changed since the packet?
+  local now_ref stale=0
+  now_ref="$(esc_current_baseline)"
+  local then_ref
+  then_ref="$(esc_state_q --arg i "$id" '[.escalations[] | select(.id == $i) | .baseline_ref][0]')"
+  if [ "$now_ref" != "$then_ref" ]; then stale=1; fi
+
+  # ---- record the answer ---------------------------------------------
+  {
+    printf '\n---\n\n## ANSWER — %s\n\n' "$(esc_now)"
+    printf 'kind: %s\n' "$kind"
+    [ "$stale" = 1 ] && printf 'STALE: baseline changed since packet (%s -> %s) — re-verify before applying\n' "$then_ref" "$now_ref"
+    [ -n "$psession" ] && printf 'panel_session: %s\n' "$psession"
+    [ -n "$psha" ] && printf 'panel_snapshot_sha: %s\n' "$psha"
+    [ -n "$poutcome" ] && printf 'panel_outcome: %s\n' "$poutcome"
+    printf '\n'
+    if [ -n "$text" ]; then printf '%s\n\n' "$text" | esc_redact
+    elif [ "$kind" = "authoritative" ] && [ -n "$psession" ] && [ -f "$psession/consensus.md" ]; then
+      printf 'Ratified panel result (authoritative; new frozen baseline):\n\n'
+      esc_bound 60 "$psession/consensus.md" | esc_redact
+      printf '\n'
+    else
+      printf '(answer text recorded by caller)\n\n'
+    fi
+  } >> "$esc_path"
+  local tmprec; tmprec="$(mktemp)"
+  awk '!done && /^status: pending$/ {print "status: answered"; done=1; next} {print}' "$esc_path" > "$tmprec" && mv "$tmprec" "$esc_path"
+
+  local qh2
+  qh2="$(esc_state_q --arg i "$id" '[.escalations[] | select(.id == $i) | .question_hash][0]')"
+  local kind_extra
+  case "$kind" in
+    authoritative)
+      kind_extra="| .baseline_ref = \"$psha\" | .baseline_path = \"$psession/consensus.md\" | .state = \"RESUMED\"" ;;
+    human-authorization)
+      kind_extra="| .authorization = {id:\"$id\", at:\"$(esc_now)\"} | .state = \"RESUMED\"" ;;
+    *)
+      kind_extra="| .state = \"RESUMED\"" ;;
+  esac
+  local stale_bit=""
+  [ "$stale" = 1 ] && stale_bit="| .escalations |= map(if .id == \"$id\" then .stale = true else . end)"
+  esc_state_set ".escalations |= map(if .id == \"$id\" then .status = \"answered\" else . end)
+    | .questions[\"$qh2\"].state = \"answered\"${stale_bit}${kind_extra}"
+  esc_render_goal_state
+
+  if [ "$stale" = 1 ]; then
+    printf 'ANSWER recorded for %s — STALE (baseline changed since packet: %s -> %s). Re-verify or re-escalate rather than blindly apply.\n' "$id" "$then_ref" "$now_ref"
+    return "$ESC_E_STALE"
+  fi
+  case "$kind" in
+    authoritative)
+      printf 'ANSWER recorded for %s — AUTHORITATIVE. New frozen baseline %s (session %s). Worker resumes original goal under the amended baseline; previous baseline superseded.\n' "$id" "$psha" "$psession"
+      ;;
+    human-authorization)
+      printf 'ANSWER recorded for %s — HUMAN AUTHORIZATION granted. The blocked action is now authorized; resume the original goal.\n' "$id"
+      ;;
+    *)
+      printf 'ANSWER recorded for %s — %s (advisory/external evidence only; it does NOT change the frozen baseline and must be independently verified).\n' "$id" "$kind"
+      ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------------- baseline
+cmd_baseline() {
+  local f=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --file) f="$2"; shift 2 ;;
+      *) esc_die "baseline: unknown arg: $1" ;;
+    esac
+  done
+  esc_require_state
+  [ -n "$f" ] && [ -f "$f" ] || esc_die "baseline: --file <path> (existing file) required"
+  local sha; sha="$(esc_sha_file "$f")"
+  esc_state_set ".baseline_path = \"$f\" | .baseline_ref = \"sha256:$sha\""
+  esc_render_goal_state
+  printf 'BASELINE pinned: %s -> sha256:%s\n' "$f" "$sha"
+}
+
+# ---------------------------------------------------------------- resume
+cmd_resume() {
+  esc_require_state
+  esc_state_set '.state = "NORMAL" | .fail_streak = 0 | .no_progress_streak = 0'
+  esc_render_goal_state
+  {
+    printf 'RESUME DIRECTIVE\n'
+    printf 'Original goal: %s\n' "$(esc_state_get '.goal')"
+    printf 'Baseline: %s (%s)\n' "$(esc_state_get '.baseline_ref')" "$(esc_state_get '.baseline_path // "no pinned file"')"
+    local auth; auth="$(esc_state_get '.authorization // empty')"
+    [ -n "$auth" ] && printf 'Human authorization on file for the blocked action.\n'
+    # stale / answered escalations the worker must honour or re-verify
+    esc_state_get -r '.escalations[] | select(.stale == true) | "STALE-ADVICE: " + .id + " (" + .class + ") — baseline drifted; re-verify or re-escalate, do not blindly apply"'
+    esc_state_get -r '.escalations[] | select(.stale != true and .status == "answered" and .helpful == false) | "CONSTRAINT: " + .id + " (" + .class + ") advice recorded — apply with independent verification"'
+    printf 'Continue the original goal. Re-evaluate triggers on the next attempt; local autonomy is the default.\n'
+  }
+}
+
+# ---------------------------------------------------------------- status
+cmd_status() {
+  esc_require_state
+  esc_state_get -r '. as $s |
+    "state: " + $s.state +
+    "\ngoal: " + $s.goal +
+    "\nfail_streak: " + ($s.fail_streak|tostring) + "/" + ($s.config.min_distinct_attempts|tostring) +
+    "\nno_progress_streak: " + ($s.no_progress_streak|tostring) + "/" + ($s.config.no_progress_cycles|tostring) +
+    "\ndistinct_attempts: " + ([ $s.attempts[] | select(.repeat == false) ] | length | tostring) +
+    "\noscillations: " + ($s.oscillations|tostring) +
+    "\nescalations: " + ($s.escalations|length|tostring) + "/" + ($s.config.max_escalations_per_goal|tostring) +
+    "\nclass: " + (.events as $ev | if ($ev|length) > 0 then ($ev | last | .class) else "IMPLEMENTATION/DEBUG" end) +
+    "\nbaseline_ref: " + $s.baseline_ref'
+}
+
+# -------------------------------------------------------------- dispatch
+case "$cmd" in
+  init) cmd_init "$@" ;;
+  attempt) cmd_attempt "$@"; exit $? ;;
+  event) cmd_event "$@"; exit $? ;;
+  classify) cmd_classify; exit $? ;;
+  packet) cmd_packet "$@"; exit $? ;;
+  answer) cmd_answer "$@"; exit $? ;;
+  baseline) cmd_baseline "$@" ;;
+  resume) cmd_resume ;;
+  status) cmd_status; exit $? ;;
+  help|-h|--help) usage ;;
+  *) esc_die "unknown command: $cmd (see: escalate help)" ;;
+esac

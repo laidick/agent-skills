@@ -1,0 +1,29 @@
+name: private-handle-lint
+# panel-orc R1 (2026-09-10): the public tree must never carry private handles —
+# a machine gate so "safe by construction" is an invariant, not a T0 property.
+# The handle set is stored base64-encoded so this file itself does not spell out
+# the strings it guards against. Decode locally: echo <blob> | base64 -d
+on: [push, pull_request]
+
+jobs:
+  handle-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: No private handles anywhere in the tree
+        env:
+          HANDLE_B64: ZHN2NGZ8ci10cmFkZXJ8NTA5MC1xd2VufGxsbS1nYXRld2F5LW5leHQtcGhhc2V8Z2xtNTN8ZGlja2xhaXxsYWlkaWNrfDE5Mi4xNjgufGFpLXNlcnZlcnxzaGFyb258cmF2eW58cHJ1ZGVuY2U=
+        run: |
+          RE="$(printf '%s' "$HANDLE_B64" | base64 -d)"
+          if git grep -nE "$RE" -- . ; then
+            echo "::error::Private handles found in the tree — neutralize (generic label) or move the content to the private repo."
+            exit 1
+          fi
+          echo "clean"
+      - name: No secrets
+        run: |
+          if git grep -nE 'ghp_[A-Za-z0-9]{30,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{35}|xox[baprs]-[A-Za-z0-9-]{10,}|BEGIN [A-Z ]*PRIVATE KEY' -- . ; then
+            echo "::error::Secret-looking strings found."
+            exit 1
+          fi
+          echo "clean"

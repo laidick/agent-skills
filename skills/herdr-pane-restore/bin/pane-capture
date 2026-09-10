@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# pane-capture — write a layout snapshot (for pane-restore) from the LIVE layout of THIS workspace.
+# Run it from a pane inside the target workspace (herdr pane layout reports the caller's workspace).
+#
+# The manifest names the GRID panes (its .panels keys, e.g. panel-* labels); every other pane in
+# the workspace is recorded as the left/orchestrator column (sorted by y). Output schema is exactly
+# what panel-restore/pane-restore reads: {tab_w, tab_h, left:[{pane_id,h,w,x,y}], panels:{label:{x,y,w,h}}}.
+#
+# Usage: pane-capture <manifest.json> <out-snapshot.json> [--manifest-out <out-manifest.json>]
+#   --manifest-out  also write a manifest COPY with pane_id filled in per label (optional: the
+#                  restore engine re-resolves labels live; pane_id here is for audit only)
+set -euo pipefail
+man="${1:?usage: pane-capture <manifest.json> <out-snapshot.json> [--manifest-out <out>]}"
+out="${2:?usage: pane-capture <manifest.json> <out-snapshot.json>}"
+shift 2
+man_out=""
+while [ $# -gt 0 ]; do case "$1" in
+  --manifest-out) man_out="$2"; shift 2;;
+  *) echo "unknown arg: $1" >&2; exit 1;;
+esac; done
+[ -f "$man" ] || { echo "no manifest: $man" >&2; exit 1; }
+
+python3 - "$man" "$out" "$man_out" <<'PY'
+import json, subprocess, sys, datetime
+man_path, out_path, man_out = sys.argv[1], sys.argv[2], sys.argv[3]
+man = json.load(open(man_path))
+grid_labels = set(man.get('panels', {}).keys())
+
+lay = json.loads(subprocess.run(['herdr','pane','layout'], capture_output=True, text=True).stdout)['result']['layout']
+panes = json.loads(subprocess.run(['herdr','pane','list'], capture_output=True, text=True).stdout)['result']['panes']
+rect = {p['pane_id']: p['rect'] for p in lay['panes']}
+ws = lay['workspace_id']
+
+snap = {"captured_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "workspace": ws, "tab": lay['tab_id'],
+        "tab_w": lay['area']['width'], "tab_h": lay['area']['height'],
+        "left": [], "panels": {}}
+for p in panes:
+    if p.get('workspace_id') != ws or p['pane_id'] not in rect: continue
+    lbl = p.get('label') or ''
+    r = rect[p['pane_id']]
+    if lbl in grid_labels:
+        snap['panels'][lbl] = {"x": r['x'], "y": r['y'], "w": r['width'], "h": r['height'], "pane_id": p['pane_id']}
+    else:
+        snap['left'].append({"pane_id": p['pane_id'], "label": lbl,
+                             "h": r['height'], "w": r['width'], "x": r['x'], "y": r['y']})
+snap['left'].sort(key=lambda e: e['y'])
+
+missing = grid_labels - set(snap['panels'].keys())
+if missing:
+    print(f"WARNING: {len(missing)} manifest label(s) have no live pane: {sorted(missing)}", file=sys.stderr)
+json.dump(snap, open(out_path, 'w'), indent=1)
+if man_out:
+    for lbl, g in snap['panels'].items():
+        if lbl in man.get('panels', {}):
+            man['panels'][lbl]['pane_id'] = g['pane_id']
+    json.dump(man, open(man_out, 'w'), indent=1)
+print(f"snapshot: {len(snap['panels'])}/{len(grid_labels)} grid panes, {len(snap['left'])} column panes, "
+      f"tab {snap['tab_w']}x{snap['tab_h']} -> {out_path}")
+PY

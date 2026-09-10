@@ -1,0 +1,30 @@
+# Generated runtime state — never canonical
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Session artifacts / panel outputs (belong to the workspace, not the skill)
+sessions/
+*.session.json
+transcript.md
+
+# Logs, caches, temp
+*.log
+*.tmp
+*.swp
+.cache/
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Local overrides
+.env
+*.local
+
+# autonomous-escalation runtime worker state (never canonical)
+.pi/
+
+# sync machinery lives in the private wiki repo (fleet/), never here
+systemd/
+bin/agent-skills-sync.sh

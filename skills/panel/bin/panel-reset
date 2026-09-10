@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+# panel-reset — establish or inspect pane-reuse context isolation (v1.12.0).
+# A `panel-*` pane may be reused across panel sessions, but its AGENT CONVERSATION must be fresh before
+# it receives round-1 work. This runs the per-kind reset recipe, restores the configured model/thinking/
+# effort, VERIFIES the result (TUI context footer + an in-agent isolation probe) and persists the verdict
+# to $PANEL_STATE_DIR/reset/<label>.json, which panel-roster's `clean` column and the blind-round gate read.
+#
+# Usage:
+#   panel-reset --status                       show every pane's isolation state (no pane is touched)
+#   panel-reset <session> [--only p1,p2]       reset the panes that are not already clean for that session
+#   panel-reset <session> --force              reset even panes reported clean
+# Never touches a working or blocked pane (rule 8); an unverifiable reset is recorded UNCLEAN, and an
+# unclean pane is not eligible for r1 — panel-dispatch blind fails closed rather than dispatching it.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+sess=""; only=""; force=0; status=0
+while [ $# -gt 0 ]; do case "$1" in
+  --status) status=1; shift;;
+  --only) only="$2"; shift 2;;
+  --force) force=1; shift;;
+  -h|--help) sed -n '2,17p' "$0"; exit 0;;
+  -*) die "unknown arg: $1";;
+  *) sess="$1"; shift;;
+esac; done
+
+d=""; sid=""
+if [ -n "$sess" ]; then d="$(resolve_session "$sess")"; sid="$(jq -r '.session_id // empty' "$d/session.json")"; fi
+
+if [ "$status" = 1 ] || [ -z "$d" ]; then
+  printf '%-30s %-8s %-9s %-9s %-22s %s\n' PANEL CLEAN ATTEMPTED VERIFIED RESET_AT REASON
+  [ -f "$PANEL_MANIFEST" ] || die "no manifest at $PANEL_MANIFEST"
+  while IFS= read -r label; do
+    IFS=$'\t' read -r cl cr < <(reset_check "$label" "$sid")
+    printf '%-30s %-8s %-9s %-9s %-22s %s\n' "${label#$PANEL_PREFIX}" "$cl" \
+      "$(reset_state_get "$label" '.reset_attempted' false)" "$(reset_state_get "$label" '.reset_verified' false)" \
+      "$(reset_state_get "$label" '.reset_at' -)" "${cr:0:100}"
+  done < <(jq -r '.panels | keys[]' "$PANEL_MANIFEST")
+  exit 0
+fi
+
+"$(dirname "$0")/panel-roster" --write "$d" >/dev/null
+clean=0; failed=0; skipped=0
+while IFS=$'\t' read -r label panel pane kind st; do
+  if [ -n "$only" ] && ! printf ',%s,' "$only" | grep -q ",$panel,"; then continue; fi
+  IFS=$'\t' read -r cl cr < <(reset_check "$label" "$sid")
+  if [ "$cl" = clean ] && [ "$force" = 0 ]; then
+    printf '%-30s %-7s already clean (%s)\n' "$panel" "$pane" "${cr:0:60}"; clean=$((clean + 1)); continue
+  fi
+  # `&& rc=0 || rc=$?` — under `set -euo pipefail` a bare `; rc=$?` never runs when reset_pane
+  # exits 1/2, killing the whole loop: one failed pane aborted the remaining fan-out (production
+  # 2026-09-08, codex rc=1 then rc=2 left the later panes unreset until the 04a110e hotfix).
+  reset_pane "$label" "$pane" "$kind" "$sid" "$d" && rc=0 || rc=$?
+  reason="$(reset_state_get "$label" '.reset_reason' 'no reason recorded')"
+  case "$rc" in
+    0) printf '%-30s %-7s VERIFIED CLEAN — %s\n' "$panel" "$pane" "${reason:0:100}"; clean=$((clean + 1));;
+    2) printf '%-30s %-7s not attempted — %s\n' "$panel" "$pane" "${reason:0:100}"; skipped=$((skipped + 1));;
+    *) printf '%-30s %-7s UNCLEAN — %s\n' "$panel" "$pane" "${reason:0:140}"; failed=$((failed + 1));;
+  esac
+done < <(jq -r '.panels[] | [.label, .panel, .pane_id, (.kind // "-"), .status] | @tsv' "$d/roster.json")
+
+"$(dirname "$0")/panel-roster" --write "$d" >/dev/null
+printf '\n%s clean, %s unclean, %s not attempted. Only clean panes are eligible for a blind round.\n' "$clean" "$failed" "$skipped"
+printf 'NEXT: %s/panel-roster --table   # then panel-dispatch %s blind\n' "$(dirname "$0")" "$d"
+[ "$clean" -gt 0 ]

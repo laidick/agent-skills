@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# panel-report — assemble REPORT.md for the human from the session's files. No herdr needed.
+# Usage: panel-report <session>
+# Outcome is the label panel-matrix wrote (CONSENSUS | CONSENSUS-PARTIAL (…) | SPLIT-WITH-RECORD (…)); cap reached without
+# ratification → SPLIT; else INCOMPLETE. Every ratified label prints the consensus body (U16). Absences without a recorded
+# class fall back to the budget state file of that panel's label (U30). Members = session.json.members (U17).
+# If <session>/summary.md exists (orchestrator's plain-language digest) it is included near the top.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+B_dir="$(dirname "$(readlink -f "$0")")"
+command -v jq >/dev/null 2>&1 || die "jq is required"
+[ $# -ge 1 ] || die "usage: panel-report <session>"
+d="$(resolve_session "$1")"; shopt -s nullglob
+sid="$(jq -r .session_id "$d/session.json")"; state="$(jq -r .state "$d/session.json")"; max="$(jq -r .max_rounds "$d/session.json")"
+last="$(latest_round "$d")"
+disc=0; for rj in "$d"/rounds/r*/round.json; do case "$(jq -r .type "$rj")" in blind|cross) disc=$((disc+1));; esac; done
+
+outcome="INCOMPLETE"; detail="session state: $state"
+if [ "$state" = ratified ] && [ -s "$d/consensus.md" ]; then
+  outcome="$(jq -r '.outcome // "CONSENSUS"' "$d/session.json")"; detail="$(grep -m1 '^Ratified ' "$d/consensus.md" || sed -n '3p' "$d/consensus.md")"
+elif [ "$disc" -ge "$max" ] && [ "$state" != ratified ]; then
+  outcome="SPLIT"; detail="discussion round cap reached ($disc/$max) without full agreement; the orchestrator does not break ties"
+fi
+
+# latest conflict picture: prefer last votes.json, else last disagreements.json
+open_md="none"
+for ((r=last; r>=1; r--)); do
+  if [ -f "$d/rounds/r$r/votes.json" ]; then
+    open_md="$(jq -r '[.conflicts[] | select(.resolved|not)] | if length==0 then "none open in round '"$r"'" else .[] | "### \(.id) — \(.topic)\n" + (.positions | to_entries | map("- **\(.key)**: \(.value.summary)") | join("\n")) + "\n\nVotes: " + (.votes | map("\(.panel)=\(.choice)") | join(", ")) + (if (.missing|length)>0 then " · missing: \(.missing|join(", "))" else "" end) + "\n" end' "$d/rounds/r$r/votes.json")"; break
+  elif [ -f "$d/rounds/r$r/disagreements.json" ]; then
+    open_md="$(jq -r '.conflicts | if length==0 then "none identified after round '"$r"'" else .[] | "### \(.id) — \(.topic)\n" + (.positions | to_entries | map("- **\(.key)**: \(.value.summary)  _(held by: \((.value.held_by//[])|join(", ")))_") | join("\n")) + "\n" end' "$d/rounds/r$r/disagreements.json")"; break
+  fi
+done
+
+out="$d/REPORT.md"
+{
+  printf '# Panel report — %s\n\n' "$sid"
+  printf -- '- generated: %s\n- outcome: **%s** — %s\n- rounds: %s (discussion %s/%s)\n- session dir: `%s`\n' "$(now_iso)" "$outcome" "$detail" "$last" "$disc" "$max" "$d"
+  # U42 (iteration 3): the skill revision(s) the rounds ran against
+  revs="$(for rj in "$d"/rounds/r*/round.json; do jq -r 'select(.skill_rev != null) | "r\(.round) \(.skill_version // "?")@\(.skill_rev)"' "$rj"; done | paste -sd ',' - | sed 's/,/, /g')"
+  [ -z "$revs" ] || printf -- '- skill tree at dispatch (U42): %s%s\n' "$revs" "$([ "$(for rj in "$d"/rounds/r*/round.json; do jq -r '.skill_rev // empty' "$rj"; done | sort -u | wc -l)" -gt 1 ] && printf ' — CHANGED MID-SESSION (see transcript TOOLING entries)')"
+  printf -- '- outcome labels (ratified D2-B/U7): CONSENSUS = every session member signed and no conflict left open; CONSENSUS-PARTIAL = signed by every responder, some members never signed (abstained, absent or objected earlier — named); SPLIT-WITH-RECORD = the ratified document records unresolved conflicts; SPLIT = cap reached without ratification; INCOMPLETE = stopped early.\n\n'
+  if [ -s "$d/summary.md" ]; then printf '## Summary (orchestrator, plain language)\n\n'; cat "$d/summary.md"; printf '\n\n'; fi
+  printf '## Question\n\n'; sed '1d' "$d/00-intake.md"; printf '\n'
+  case "$outcome" in
+    CONSENSUS*|SPLIT-WITH-RECORD*) printf '## Consensus (ratified by the panels — label: %s)\n\n' "$outcome"; sed '1d' "$d/consensus.md"; printf '\n';;   # U16: every ratified label carries the body
+    *) printf '## Open conflicts\n\n%s\n\n' "$open_md";;
+  esac
+  printf '## Rounds\n\n'
+  for rj in "$d"/rounds/r*/round.json; do
+    r="$(jq -r .round "$rj")"; rd="$(dirname "$rj")"
+    printf '### r%s — %s (dispatched %s)\n\n' "$r" "$(jq -r .type "$rj")" "$(jq -r .dispatched_at "$rj")"
+    if [ -f "$rd/collect.json" ]; then
+      jq -r '"- answered: \((.answered_unconfirmed // []) as $u | .answered | map(. as $p | if ($u|index($p)) != null then $p + " (file unconfirmed)" else $p end) | join(", ") | if .=="" then "-" else . end)" + (if ((.answered_late//[])|length)>0 then " · late: \(.answered_late|join(", "))" else "" end) + "\n- no response: \(.no_response|join(", ")|if .=="" then "-" else . end)\n- timeout: \(.timeout|join(", ")|if .=="" then "-" else . end)\n- blocked: \(.blocked|join(", ")|if .=="" then "-" else . end)\n- budget-exhausted: \((.budget_exhausted//[])|join(", ")|if .=="" then "-" else . end)\n- failed: \((.failed//[])|join(", ")|if .=="" then "-" else . end)\n- skipped: \(.skipped|join(", ")|if .=="" then "-" else . end)\n- gone: \(.gone|join(", ")|if .=="" then "-" else . end)"' "$rd/collect.json"
+      absent=""
+      while IFS=$'\t' read -r ap ast areason acls; do   # U30: no class recorded → look at the budget state of that panel's label
+        if [ -z "$acls" ] || [ "$acls" = null ]; then
+          lbl="$(jq -r --arg p "$ap" '.panels[] | select(.panel==$p) | .label' "$rd/roster.json" 2>/dev/null || true)"
+          bs="$PANEL_STATE_DIR/budget/${lbl:-none}.json"
+          [ -s "$bs" ] && acls="budget state: $(jq -r '"\(.class) \(.hint // "") (until \(.reset_iso // .reset // "?"))"' "$bs" 2>/dev/null)"
+        fi
+        absent+="${absent:+; }$ap — $ast: $areason${acls:+ [$acls]}"
+      done < <(jq -s -r '.[] | select(.state|IN("no-response","timeout","gone","budget-exhausted","failed","skipped")) | [.panel, .state, .reason, (.reason_class // "")] | @tsv' "$rd"/meta/*.json)
+      [ -z "$absent" ] || printf -- '- absent, with reason: %s\n' "$absent"
+      pc="$(jq -r '(.answered_post_consensus // []) | if length==0 then "" else "- answered after ratification (post-consensus, not merged): " + join(", ") end' "$rd/collect.json")"; [ -z "$pc" ] || printf '%s\n' "$pc"
+      if jq -e '.panels' "$rd/collect.json" >/dev/null 2>&1; then
+        printf '\n| panel | state | latency s | brief bytes | answer bytes | nudges | class |\n|---|---|---|---|---|---|---|\n'
+        jq -r '.panels | to_entries[] | "| \(.key) | \(.value.state) | \(.value.latency_s // "-") | \(.value.dispatch_bytes // "-") | \(.value.answer_bytes // "-") | \(.value.nudges // 0) | \(.value.reason_class // "-") |"' "$rd/collect.json"
+        jq -r '"| **round** | | slowest \(.round_latency_s // "-") | \([.panels[].dispatch_bytes // 0]|add) | \([.panels[].answer_bytes // 0]|add) | | collect \(.collect_seconds // "-")s |"' "$rd/collect.json"
+      fi
+    else printf -- '- not collected\n'; fi
+    [ -f "$rd/corrections.md" ] && { printf '\nCorrections raised:\n'; sed '1,3d' "$rd/corrections.md" | sed '/^[[:space:]]*$/d'; }
+    if [ -f "$rd/panels.json" ]; then
+      printf '\n| panel | confidence | verdict |\n|---|---|---|\n'
+      jq -r '.[] | select(.hard_ok) | "| \(.panel) | \(.confidence // "-") | \((.verdict|gsub("\n";" ")|.[0:240])) |"' "$rd/panels.json"
+    fi
+    [ -f "$rd/votes.json" ] && printf '\nVotes: %s\n' "$(jq -r '.conflicts | map("\(.id)=" + (if .resolved then "resolved(\(.agreed))" else "open" end)) | join(", ")' "$rd/votes.json")"
+    [ -f "$rd/ratify.json" ] && printf '\nRatify: yes=[%s] no=[%s]\n' "$(jq -r '.yes|join(", ")' "$rd/ratify.json")" "$(jq -r '(.no+.unclear)|join(", ")' "$rd/ratify.json")"
+    printf '\n'
+  done
+  # session totals: wall time first dispatch → last collect, bytes in/out
+  first="$(jq -r .dispatched_at "$d/rounds/r1/round.json" 2>/dev/null || true)"; lastc="$(jq -r .at "$d/rounds/r$last/collect.json" 2>/dev/null || true)"
+  if [ -n "$first" ] && [ -n "$lastc" ] && [ "$lastc" != null ]; then
+    wall=$(( ( $(date_epoch "$lastc" 2>/dev/null || echo 0) - $(date_epoch "$first" 2>/dev/null || echo 0) ) / 60 ))
+    printf '## Cost summary\n\n- wall time first dispatch → last collect: %s min\n' "$wall"
+    jq -s '{brief: ([.[].panels[]?.dispatch_bytes // 0]|add), answers: ([.[].panels[]?.answer_bytes // 0]|add), answered: ([.[].answered[]?, .[].answered_late[]?]|length), absent: ([.[].no_response[]?, .[].timeout[]?, .[].gone[]?, .[].budget_exhausted[]?, .[].failed[]?, .[].skipped[]?]|length)}' "$d"/rounds/r*/collect.json \
+      | jq -r '"- panel-answers collected: \(.answered) · absences: \(.absent)\n- bytes sent in briefs: \(.brief) · bytes received in answers: \(.answers)"'
+    printf '\n'
+  fi
+  # iteration 5 D5-A: context mode and reading cap per panel (from every round's meta) — two panels may have answered on different evidence
+  printf '## Participants (members = union of every round'"'"'s roster, U17: %s)\n\n| panel | pane | kind | provider | timeout s | context | reading cap |\n|---|---|---|---|---|---|---|\n' "$(jq -r '(.members // []) | join(", ")' "$d/session.json")"
+  jq -r '.panels[] | [.panel, .pane_id, (.kind // "-"), (.provider // "-"), ((.timeout_s // "-")|tostring)] | @tsv' "$d/roster.json" | while IFS=$'\t' read -r p pane kind prov tmo; do
+    ctx="$(cat "$d"/rounds/r*/meta/"$p".json 2>/dev/null | jq -rs '[.[] | (.context // empty)] | unique | join("/")')"; [ -n "$ctx" ] || ctx="-"
+    cap="$(cat "$d"/rounds/r*/meta/"$p".json 2>/dev/null | jq -rs '[.[] | ((.reading_cap // "none")|tostring)] | unique | join("/")')"; [ -n "$cap" ] || cap="-"
+    printf '| %s | %s | %s | %s | %s | %s | %s |\n' "$p" "$pane" "$kind" "$prov" "$tmo" "$ctx" "$cap"
+  done
+  printf '\nOrchestrator pane: %s (not a panel; drove the process, added no opinion to the consensus).\n\n' "$(jq -r .orchestrator_pane "$d/session.json")"
+  [ -s "$d/consensus-draft.changelog.md" ] && { printf '## Re-ratification change log\n\n'; sed '1,3d' "$d/consensus-draft.changelog.md"; printf '\n'; }
+  printf '## Files\n\n```\n'; (cd "$d" && find . -type f | sort | sed 's#^\./##'); printf '```\n\n'
+  printf '## Transcript (event chain)\n\n'; sed '1,3d' "$d/transcript.md"
+} > "$out"
+transcript "$d" report "REPORT.md written (outcome $outcome)"
+
+# owner rule 2026-09-09: a finished panel session ALWAYS publishes — summary + detail report in the
+# GitHub report repo, console gets the full URL + quick summary. panel-publish is idempotent (a
+# re-run updates in place, a new commit only when content changed) and fails loud without burying
+# the local REPORT.md path: a session is not "done reporting" until it is published or the human
+# has been told exactly why it could not be.
+pub_out="$("$B_dir/panel-publish" "$d" 2>&1)" || pub_rc=$? || pub_rc=0
+printf '%s\n%s — %s\n' "$out" "$outcome" "$detail"
+if [ "${pub_rc:-0}" = 0 ]; then
+  printf '%s\n' "$pub_out"
+else
+  printf 'panel: publishing FAILED (rc=%s) — REPORT.md is safe locally at %s\n%s\n' "${pub_rc:-?}" "$out" "$pub_out" >&2
+  transcript "$d" publish "publish failed (rc=${pub_rc:-?}) — REPORT.md remains local; re-run panel-publish after fixing"
+fi

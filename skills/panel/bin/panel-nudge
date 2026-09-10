@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# panel-nudge — send one extra prompt to one panel in the current round and log it.
+# Usage: panel-nudge <session> <panel> [text]      (default text = the original pointer, prefixed REMINDER)
+# Never use this to answer an approval/permission dialog — that is the human's decision.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+[ $# -ge 2 ] || die "usage: panel-nudge <session> <panel> [text]"
+d="$(resolve_session "$1")"; panel="$2"; text="${3:-}"
+round="$(latest_round "$d")"; meta="$d/rounds/r$round/meta/$panel.json"
+[ -f "$meta" ] || die "no meta for panel '$panel' in round $round"
+pane="$(jq -r .pane_id "$meta")"
+[ -n "$text" ] || text="REMINDER — $(jq -r .pointer "$meta")"
+st="$(agent_status "$pane")"
+[ "$st" != blocked ] || die "$panel is blocked on a dialog; read rounds/r$round/raw/$panel.blocked.txt and ask the human"
+herdr agent prompt "$pane" "$text" >/dev/null
+json_set "$meta" '.nudges+=1 | .seen_working=false | .nudged_at_epoch=$t | .state=(if .state=="dispatched" then "nudged" else .state end) | .updated=$u' --argjson t "$(now_epoch)" --arg u "$(now_iso)"
+transcript "$d" "r$round" "$panel nudged: ${text:0:120}"
+printf 'nudged %s (%s)\n' "$panel" "$pane"

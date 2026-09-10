@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+# panel-dispatch — fan one round out to every dispatchable panel. Never waits.
+# Usage: panel-dispatch <session> <blind|cross|focus|ratify> [--dry-run] [--only p1,p2,...] [--only-auto] [--ids D1,D4]
+#                       [--reason TEXT] [--context all|r1+matrix|conflicts] [--no-heal] [--no-probe] [--no-queue] [--no-reset]
+#   blind  : round 1 only. Independent answers, panels see nothing of each other.
+#   cross  : needs rounds/r<prev>/disagreements.json (validated, D6-A/U19). --only needs --reason (AUDIT, shown in the brief; D3-A). Injects the framing conflict D0 (D5-A/D4-A):
+#            A = the conflict list is complete and fairly framed / B = it is not (say what). Panels may PROMOTE a pending item.
+#   focus  : only the conflicts in --ids (default: every open one), only the panels in --only (default with --only-auto:
+#            every panel holding a minority letter, derived from the last votes.json — refuses if the majority is not clean);
+#            once per session; does not count against the cap. Non-dispatched panels keep their previous vote.
+#   ratify : needs <session>/consensus-draft.md (passes panel-draft --verify). The draft is SNAPSHOTTED (rounds/rN/consensus-
+#            draft.dispatched.md + sha256 in round.json): what the panels read is what gets published (U28). A re-ratification
+#            regenerates the change log against the previous snapshot and refuses if any edit lies outside the objection
+#            spans (D3-B/U21). After a ratified session, `ratify --only <unsigned> --reason …` is the one allowed top-up (D2-B).
+# Context sent (D1-A, ratified 2026-09-05; D11-A re-ratified): default `all` = every earlier answer file. Switching the default
+#   needs a recorded measurement and a recorded decision (see SKILL.md). `--context r1+matrix` = r1 answers + previous matrix.md +
+#   current disagreements.json; `--context conflicts` = positions and every vote with its complete reason rendered in the brief.
+#   manifest panels.<label>.context overrides per panel; reading_cap trims the charter's numbered Reading set only.
+# Before dispatch: panel-heal (unless --no-heal), panel-budget --probe on blind (unless --no-probe), panel-roster (budget gate).
+# Session membership (U17) = union of every round's roster, kept in session.json.members — the D2-B denominator.
+# A panel whose agent is `working` gets its brief written and state `queued`; panel-collect delivers the pointer when it settles (U15).
+# Every conflict dispatched is logged to transcript.md with its positions and holders (U5 audit trail).
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+require_herdr
+sess=""; type=""; dry=0; only=""; only_auto=0; ids=""; reason=""; ctx=""; heal=1; probe=1; queue=1; reset=1
+while [ $# -gt 0 ]; do case "$1" in
+  --dry-run) dry=1; shift;;
+  --no-reset) reset=0; shift;;
+  --only) only="$2"; shift 2;;
+  --only-auto) only_auto=1; shift;;
+  --ids) ids="$2"; shift 2;;
+  --reason) reason="$2"; shift 2;;
+  --context) ctx="$2"; shift 2;;
+  --no-heal) heal=0; shift;;
+  --no-probe) probe=0; shift;;
+  --no-queue) queue=0; shift;;
+  --allow-paraphrase) die "--allow-paraphrase was removed (D10-A, ratified 2026-09-05): quote the panel's sentence and cite it";;
+  -h|--help) sed -n '2,22p' "$0"; exit 0;;
+  -*) die "unknown arg: $1";;
+  *) if [ -z "$sess" ]; then sess="$1"; elif [ -z "$type" ]; then type="$1"; else die "too many args"; fi; shift;;
+esac; done
+[ -n "$sess" ] && [ -n "$type" ] || die "usage: panel-dispatch <session> <blind|cross|focus|ratify> [options]  (--help)"
+case "$type" in blind|cross|focus|ratify) ;; *) die "type must be blind|cross|focus|ratify";; esac
+ctx="${ctx:-all}"; case "$ctx" in r1+matrix|all|conflicts) ;; *) die "--context must be all|r1+matrix|conflicts";; esac
+B="$(dirname "$0")"
+
+d="$(resolve_session "$sess")"
+sid="$(jq -r .session_id "$d/session.json")"
+max_rounds="$(jq -r .max_rounds "$d/session.json")"
+prev="$(latest_round "$d")"; round=$((prev + 1)); rd="$d/rounds/r$round"
+[ ! -e "$rd" ] || die "$rd already exists"
+charter_unfilled "$d/charter.md" && die "charter.md still contains <<FILL>> markers — finish the charter first (HTML comments are ignored; fill every marker in the content)"
+already="$(jq -r '.outcome // empty' "$d/session.json")"
+if [ -n "$already" ] && [ -s "$d/consensus.md" ] && ! { [ "$type" = ratify ] && [ -n "$only" ]; }; then
+  die "session already ratified ($already). Only 'ratify --only <unsigned> --reason …' is accepted after ratification (U29/D2-B); a new question is a new session"
+fi
+
+disc=0; focus_used=0; shopt -s nullglob
+for rj in "$d"/rounds/r*/round.json; do
+  t="$(jq -r .type "$rj")"; case "$t" in blind|cross) disc=$((disc + 1));; focus) focus_used=$((focus_used + 1));; esac
+done
+
+norm() { tr -s '[:space:]' ' ' | sed 's/^ //; s/ $//'; }
+norm_hdr='h=$0; sub(/^#+[[:space:]]+/,"",h); gsub(/\*/,"",h); sub(/^[0-9]+[.)][[:space:]]*/,"",h); gsub(/[[:space:]]*:?[[:space:]]*$/,"",h); h=toupper(h)'
+section()   { awk -v name="$2" "/^##+[[:space:]]+/ { $norm_hdr; inside=(h==name); next } inside { print }" "$1"; }
+# U48 (iteration 4): a claim line is `C<n>` followed by . : ) or whitespace (so `- **C7 — …**` counts and C1 never matches C10) — the same rule panel-matrix parses with
+claim_text(){ awk -v n="$2" 'BEGIN{re="^[[:space:]]*([-*][[:space:]]*)?\\**" n "\\**([.:)]|[[:space:]]|$)"} $0 ~ re {p=1; print; next} p && ($0 ~ /^[[:space:]]*([-*][[:space:]]*)?\**C[0-9]+\**([.:)]|[[:space:]]|$)/ || $0 ~ /^##/) {exit} p {print}' "$1"; }
+# resolve one ref "path#ANCHOR …" → prints the referenced text (claim or section) or fails; path may use an r* glob
+ref_text() {
+  local r="$1" rf anchor tok f out=""
+  rf="${r%%#*}"; anchor="${r#*#}"; [ "$anchor" != "$r" ] || return 1
+  case "$rf" in /*) ;; *) rf="$d/$rf";; esac
+  tok="${anchor%% *}"
+  for f in $rf; do
+    [ -f "$f" ] || continue
+    printf '%s' "$f" | grep -qE '/rounds/r[0-9]+/in/[^/]+\.md$' || continue
+    case "$tok" in
+      C[0-9]*) out="$(claim_text "$f" "$tok")";;
+      *) # D14-A: try the whole anchor as a section name first ("NEW CONFLICTS", "KEY CLAIMS"), then its first word ("REASONING Q3, D5")
+         out="$(section "$f" "$(printf '%s' "$anchor" | tr 'a-z' 'A-Z')")"
+         [ -n "$out" ] || out="$(section "$f" "$(printf '%s' "$tok" | tr 'a-z' 'A-Z')")";;
+    esac
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+  done
+  return 1
+}
+find_dis() { local r; for ((r = prev; r >= 1; r--)); do [ -s "$d/rounds/r$r/disagreements.json" ] && { printf '%s' "$d/rounds/r$r/disagreements.json"; return 0; }; done; return 1; }
+last_votes() { local r; for ((r = prev; r >= 1; r--)); do [ -s "$d/rounds/r$r/votes.json" ] && [ "$(jq -r .type "$d/rounds/r$r/votes.json")" != ratify ] && { printf '%s' "$d/rounds/r$r/votes.json"; return 0; }; done; return 1; }
+last_snapshot() { local r; for ((r = prev; r >= 1; r--)); do [ -s "$d/rounds/r$r/consensus-draft.dispatched.md" ] && { printf '%s' "$d/rounds/r$r/consensus-draft.dispatched.md"; return 0; }; done; return 1; }
+# D6-A + U19: every position summary must be a verbatim substring of the claim/section its refs point at; ≥2 positions;
+# refs name panel answer files with an anchor that exists; aliases only where the previous tally made the pair effective (D9-A)
+validate_dis() {
+  local f="$1"
+  jq -e '.conflicts | type=="array"' "$f" >/dev/null || die "$f: .conflicts must be an array"
+  jq -e '[.conflicts[].id] | length == (unique|length)' "$f" >/dev/null || die "$f: duplicate conflict ids"
+  jq -e 'all(.conflicts[]; .id != "D0")' "$f" >/dev/null || die "$f: D0 is reserved for the framing vote (D5-A)"
+  jq -e 'all(.conflicts[]; (.id|test("^D[0-9]+$")) and (.topic|type=="string") and (.positions|type=="object") and ((.positions|length)>=2) and all(.positions|keys[]; test("^[A-Z]$")) and all(.positions[]; (.summary|type=="string") and ((.aliases // []) | all(test("^[A-Z]$")))))' "$f" >/dev/null \
+    || die "$f: each conflict needs id D<n>, topic, and at least TWO positions {A:{summary,held_by,refs,aliases?},…} with single-letter keys (U19)"
+  jq -e '(.conflicts | any(.recommended? or .likely? or .orchestrator_view?)) | not' "$f" >/dev/null || die "$f: orchestrator opinion fields are forbidden"
+  local bad=0 id letter summary refs r corpus txt lv alias
+  lv="$(last_votes || true)"
+  while IFS=$'\t' read -r id letter summary refs; do
+    summary="$(printf '%s' "$summary" | base64 -d)"   # base64: @tsv would escape backslashes/tabs inside the quote
+    if [ -z "$(printf '%s' "$refs" | base64 -d)" ]; then printf '  %s/%s: no refs (need rounds/rN/in/<panel>.md#C<n> or #SECTION pointers)\n' "$id" "$letter"; bad=$((bad + 1)); continue; fi
+    corpus=""
+    while IFS= read -r r; do   # one ref per line (anchors may contain spaces: "#REASONING Q3, D5")
+      [ -n "$r" ] || continue
+      if txt="$(ref_text "$r")"; then corpus+="$txt "
+      else printf '  %s/%s: ref %s does not resolve (panel answer file + existing #C<n>/#SECTION anchor required)\n' "$id" "$letter" "$r"; bad=$((bad + 1)); fi
+    done < <(printf '%s\n' "$(printf '%s' "$refs" | base64 -d)")   # trailing newline: `read` would otherwise skip the last ref
+    [ -n "$corpus" ] || continue
+    if ! printf '%s' "$corpus" | norm | grep -qF -- "$(printf '%s' "$summary" | norm)"; then
+      printf '  %s/%s: summary is not a verbatim substring of the referenced claim/section (%s)\n' "$id" "$letter" "$(printf '%s' "$refs" | base64 -d | tr '\n' ' ')"; bad=$((bad + 1))
+    fi
+  done < <(jq -r '.conflicts[] | .id as $i | .positions | to_entries[] | [$i, .key, (.value.summary|@base64), (((.value.refs // []) | join("\n"))|@base64)] | @tsv' "$f")
+  # aliases must be effective equivalences from the previous tally, never orchestrator-invented (U19/D9-A)
+  while IFS=$'\t' read -r id letter alias; do
+    if [ -z "$lv" ] || ! jq -e --arg i "$id" --arg a "$letter" --arg b "$alias" '.conflicts[] | select(.id==$i) | .equivalences[] | select(. == ([$a,$b]|sort))' "$lv" >/dev/null; then
+      printf '  %s/%s: alias %s is not an effective voter-declared equivalence in %s — remove it\n' "$id" "$letter" "$alias" "${lv:-(no votes.json)}"; bad=$((bad + 1))
+    fi
+  done < <(jq -r '.conflicts[] | .id as $i | .positions | to_entries[] | .key as $k | (.value.aliases // [])[] | [$i, $k, .] | @tsv' "$f")
+  [ "$bad" -eq 0 ] || die "$f: $bad problem(s) fail D6-A/U19 (verbatim substring of the cited claim/section, ≥2 positions, resolvable refs, declared aliases). There is no bypass: quote the panel's sentence and cite it."
+}
+
+dis=""; draft=""; framing=false; topup=0
+case "$type" in
+  blind)
+    [ "$round" -eq 1 ] || die "blind round is only valid as round 1 (this would be round $round)" ;;
+  cross)
+    [ "$round" -ge 2 ] || die "cross-review needs at least one earlier round"
+    [ "$disc" -lt "$max_rounds" ] || die "discussion round cap reached ($disc/$max_rounds). Do not force it: one 'focus' round on the open ids (--only-auto), or panel-report and hand the split to the human."
+    dis="$(find_dis || true)"; [ -n "$dis" ] || die "missing rounds/r$prev/disagreements.json — orchestrator must write it (see templates/disagreements.example.json)"
+    validate_dis "$dis"
+    [ "$(jq -r '.conflicts|length' "$dis")" -gt 0 ] || die "$dis has zero conflicts — nothing to vote on; dispatch ratify instead"
+    if [ -n "$only" ]; then   # iteration 5 D3-A: narrowing a discussion round needs a recorded reason, exactly like focus
+      [ -n "$reason" ] || die "manual --only on a cross round needs --reason (logged as AUDIT, D3-A)"
+      transcript "$d" "r$round" "AUDIT: cross --only $only chosen by the orchestrator — reason: $reason"
+    fi
+    framing=true ;;
+  focus)
+    [ "$round" -ge 2 ] || die "focus needs at least one earlier round"
+    [ "$focus_used" -eq 0 ] || die "focus round already used once in this session — hand the split to the human"
+    dis="$(find_dis || true)"; [ -n "$dis" ] || die "missing rounds/rN/disagreements.json (usually: cp rounds/rN/disagreements.draft.json rounds/rN/disagreements.json)"
+    validate_dis "$dis"
+    lv="$(last_votes || true)"
+    if [ -z "$ids" ]; then   # default: every open conflict in the last tally (U4: exclusions must be explicit and logged)
+      [ -n "$lv" ] || die "focus needs --ids or a previous votes.json"
+      # D20-A (iteration 4): open ids from the last tally PLUS ids that exist only in disagreements.json (minted last round, never voted)
+      ids="$(jq -r --slurpfile D "$dis" '([.conflicts[] | select(.resolved|not) | select(.id!="D0") | .id] + [ $D[0].conflicts[].id | select(. != "D0") ]) | unique | join(",")' "$lv")"; [ -n "$ids" ] || die "no open conflicts in $lv or $dis"
+    else
+      [ -n "$lv" ] && { excluded="$(jq -r --arg ids "$ids" '[.conflicts[] | select(.resolved|not) | select(.id!="D0") | .id] - ($ids|split(",")) | join(",")' "$lv")"; [ -z "$excluded" ] || { [ -n "$reason" ] || die "--ids excludes open conflict(s) $excluded — give --reason"; transcript "$d" "r$round" "AUDIT: focus excludes open $excluded — reason: $reason"; }; }
+    fi
+    for i in ${ids//,/ }; do jq -e --arg i "$i" '.conflicts[] | select(.id==$i)' "$dis" >/dev/null || die "--ids: $i not in $dis"; done
+    if [ "$only_auto" = 1 ]; then
+      [ -n "$lv" ] || die "--only-auto needs a previous votes.json"
+      # D20-A (iteration 4): iterate the REQUESTED ids — an id absent from the last tally (minted last round) or present with no letter votes goes to every member
+      only="$(jq -r --arg ids "$ids" '. as $lv | ($ids | split(",")) as $want
+        | [ $want[] | . as $i | ([ $lv.conflicts[] | select(.id == $i) ] | .[0]) as $c
+          | if $c == null then "__ALL__"
+            else ($c.tally | to_entries | map(select(.key|test("^[A-Z]$"))) | sort_by(-.value)) as $t
+              | if ($t|length)==0 then "__ALL__"
+                elif ($t|length)>1 and $t[0].value==$t[1].value then error("no clean majority on \($c.id) (\($t|map("\(.key):\(.value)")|join(" "))) — name --only yourself and give --reason")
+                else ($t[0].key) as $maj | ($c.votes[] | select(.choice != $maj and .choice != "abstain") | .panel) end
+            end ]
+        | unique | join(",")' "$lv" 2>&1)" || die "--only-auto: $only"
+      [ -n "$only" ] || die "--only-auto found no dissenters for $ids"
+      if printf ',%s,' "$only" | grep -q ',__ALL__,'; then
+        only="$(jq -r '(.members // []) | join(",")' "$d/session.json")"
+        transcript "$d" "r$round" "focus --only-auto: at least one id in ($ids) has no votes yet (minted last round, U44) → every member asked: $only"
+      else
+        transcript "$d" "r$round" "focus --only-auto: dissenters derived from $lv → $only (ids $ids)"
+      fi
+    else
+      [ -n "$only" ] || die "focus needs --only <panels> or --only-auto"
+      [ -n "$reason" ] || die "manual --only on a focus round needs --reason (logged)"
+      transcript "$d" "r$round" "AUDIT: focus --only $only chosen by the orchestrator — reason: $reason"
+    fi ;;
+  ratify)
+    [ "$round" -ge 2 ] || die "ratify needs at least one answered round"
+    draft="$d/consensus-draft.md"
+    [ -s "$draft" ] || die "missing $draft — panel-draft --auto builds it"
+    grep -q '<<FILL' "$draft" && die "consensus-draft.md still contains <<FILL>> markers"
+    grep -qE '^[[:space:]]*<<ORCH' "$draft" && die "consensus-draft.md still contains <<ORCH…>> markers"
+    if [ -n "$already" ]; then   # D2-B top-up: the same text, only to members who have not signed
+      topup=1
+      [ -n "$only" ] && [ -n "$reason" ] || die "after ratification, ratify needs --only <unsigned members> and --reason"
+      [ "$(jq -r '.partial_retries // 0' "$d/session.json")" -eq 0 ] || die "the unsigned members were already re-asked once (D2-B) — the human decides now; panel-report"
+      rsha="$(jq -r '.ratified_sha // empty' "$d/session.json")"
+      [ -z "$rsha" ] || [ "$(sha256sum "$draft" | cut -c1-64)" = "$rsha" ] || die "consensus-draft.md differs from the ratified text (sha) — a top-up must send the same text; restore it from the ratified snapshot"
+      for p in ${only//,/ }; do jq -e --arg p "$p" '.unsigned | index($p)' "$d/session.json" >/dev/null || die "--only $p: not an unsigned member (unsigned: $(jq -r '.unsigned|join(",")' "$d/session.json"))"; done
+      transcript "$d" "r$round" "AUDIT: ratify top-up to unsigned members $only — reason: $reason"
+    else
+      [ -z "$only" ] || die "ratify goes to every panel (D3-B); --only is accepted only for the post-ratification top-up"
+      # iteration-3 r4 objection: generator scaffolding must not reach the panels — drop the fill-instruction and a bare `none` under a filled Uncontested section
+      # D21-B (iteration 4): the strips are independent — each runs whenever its condition holds, not only while the fill-instruction survives
+      before="$(sha256sum "$draft" | cut -c1-16)"
+      awk '/^_Orchestrator fills this section with bullets only/{next} {print}' "$draft" > "$draft.tmp" && mv "$draft.tmp" "$draft"
+      if awk 'BEGIN{sec=0;b=0} /^## /{sec=($0 ~ /^## Uncontested findings/)} sec && /^- \*\*/{b=1} END{exit !b}' "$draft"; then
+        awk 'BEGIN{sec=0} /^## /{sec=($0 ~ /^## Uncontested findings/)} sec && /^[[:space:]]*none[[:space:]]*$/{next} {print}' "$draft" > "$draft.tmp" && mv "$draft.tmp" "$draft"
+      fi
+      awk 'BEGIN{sec=0;blank=0} /^## /{sec=($0 ~ /^## Uncontested findings/)} { if (sec && $0 ~ /^[[:space:]]*$/) { blank++; if (blank>1) next } else blank=0; print }' "$draft" > "$draft.tmp" && mv "$draft.tmp" "$draft"
+      [ "$before" = "$(sha256sum "$draft" | cut -c1-16)" ] || transcript "$d" "r$round" "AUDIT: stripped generator scaffolding from consensus-draft.md before the gate (fill-instruction / bare none under a filled Uncontested section / blank-line runs) — mechanical"
+      "$B/panel-draft" "$d" --verify || die "consensus-draft.md failed the draft gate (U1/U25) — every “quote” verbatim and attributed to its author, no unquoted prose, vote tables matching the record"
+      if prevsnap="$(last_snapshot)"; then   # re-ratification: the change log against the text the panels last read must be clean (D3-B/U21)
+        "$B/panel-draft" "$d" --changelog >/dev/null 2>&1 || die "panel-draft --changelog failed"
+        nwarn="$(grep -c '^- .*⚠' "$d/consensus-draft.changelog.md" || true)"
+        [ "${nwarn:-0}" -eq 0 ] || die "change log vs $(basename "$prevsnap") has $nwarn ⚠ line(s) — an edit outside the objection spans (D3-B) or a removed generated line absent from the previous snapshot (D4-A). Revert them or make them D-ids; there is no bypass. The lines (5090, iteration 8):
+$(grep '^- .*⚠' "$d/consensus-draft.changelog.md" | cut -c1-300)"
+      fi
+    fi ;;
+esac
+
+# --- context-lifecycle: pane-reuse isolation (v1.12.0) --------------------------------------------
+# ROOT CAUSE this replaces: a `panel-*` pane is reused across sessions, but nothing cleared the AGENT
+# CONVERSATION between them. v1.11.0's step was opt-in (only kinds.pi had a recipe), sent ONE prompt via
+# `herdr agent prompt` (the model reads a slash command as TEXT, so it was never executed), verified only
+# a context footer where the TUI happened to show one, restored nothing, and — decisively — its verdict
+# was written to the transcript and then DISCARDED: `dispatchable` never consulted it, so a pane whose
+# reset logged "FAILED — NO EFFECT" still received the r1 brief with the previous task's evidence in
+# context. Now: manifest-driven per-kind recipe -> executed keystrokes -> footer + in-agent isolation
+# probe -> model/thinking/effort restore -> persisted verdict -> the r1 gate reads that verdict.
+if [ "$reset" = 1 ] && [ "$dry" = 0 ] && [ "$type" = blind ]; then
+  "$B/panel-roster" --write "$d" >/dev/null
+  while IFS=$'\t' read -r rlabel rpanel rpane rkind rstatus; do
+    IFS=$'\t' read -r rclean rcreason < <(reset_check "$rlabel" "$sid")
+    if [ "$rclean" = clean ]; then
+      printf 'reset      %-30s %-7s already clean for this session\n' "$rpanel" "$rpane"; continue
+    fi
+    reset_pane "$rlabel" "$rpane" "$rkind" "$sid" "$d" && rrc=0 || rrc=$?
+    rreason="$(reset_state_get "$rlabel" '.reset_reason' 'no reason recorded')"
+    case "$rrc" in
+      0) printf 'reset      %-30s %-7s VERIFIED CLEAN\n' "$rpanel" "$rpane";;
+      2) printf 'reset      %-30s %-7s not attempted: %s\n' "$rpanel" "$rpane" "$rreason";;
+      *) printf 'reset      %-30s %-7s UNCLEAN — %s\n' "$rpanel" "$rpane" "$rreason";;
+    esac
+  done < <(jq -r '.panels[] | [.label, .panel, .pane_id, (.kind // "-"), .status] | @tsv' "$d/roster.json")
+  "$B/panel-roster" --write "$d" >/dev/null   # re-read: the gate below must see the verdicts just written
+fi
+# Fail closed: in a blind round only a pane whose isolation was VERIFIED may receive r1 work (unknown and
+# unclean are both refused). `--no-reset` inherits this — skipping the reset does not grant eligibility.
+[ "$type" = blind ] && export PANEL_REQUIRE_CLEAN=1
+if [ "$heal" = 1 ] && [ "$dry" = 0 ]; then "$B/panel-heal" --session "$d" --quiet || true; fi
+if [ "$probe" = 1 ] && [ "$dry" = 0 ] && [ "$type" = blind ] && [ -f "$PANEL_MANIFEST" ]; then "$B/panel-budget" --probe --session "$d" >/dev/null 2>&1 || true; fi   # U8
+mkdir -p "$rd/in" "$rd/raw" "$rd/meta" "$rd/dispatch"
+"$B/panel-roster" --write "$d" >/dev/null
+cp "$d/roster.json" "$rd/roster.json"
+# U17: session membership is the union of every round's roster — a pane closed mid-session stays a member (and shows as unsigned)
+json_set "$d/session.json" '.members = (((.members // []) + $new) | unique)' --argjson new "$(jq -c '[.panels[].panel]' "$rd/roster.json")"
+
+# --- context lists (D1-A) --------------------------------------------------------------------------
+r1_answers=""; for f in "$d"/rounds/r1/in/*.md; do [ -s "$f" ] && r1_answers+="- round 1 (blind), panel $(basename "$f" .md): $f"$'\n'; done
+all_answers=""; for ((r = 1; r <= prev; r++)); do for f in "$d"/rounds/r$r/in/*.md; do [ -s "$f" ] && all_answers+="- round $r ($(jq -r .type "$d/rounds/r$r/round.json")), panel $(basename "$f" .md): $f"$'\n'; done; done
+prev_matrix=""; for ((r = prev; r >= 1; r--)); do [ -s "$d/rounds/r$r/matrix.md" ] && { prev_matrix="$d/rounds/r$r/matrix.md"; break; }; done
+own_answers() { local p="$1" out="" r f; for ((r = 1; r <= prev; r++)); do f="$d/rounds/r$r/in/$p.md"; [ -s "$f" ] && out+="- your round $r answer: $f"$'\n'; done; printf '%s' "$out"; }
+topup_record() { # Q3(a) (iteration 9, 5/5): a member re-asked after ratification gets the indexed discussion record, not a pointer to an unseen draft
+  local p="$1" r out="" t pr b
+  out+=$'\n'"### Discussion record for a member re-asked after ratification (Q3(a), iteration 9) — read it before you vote"$'\n'
+  for ((r = 1; r <= prev; r++)); do
+    [ -s "$d/rounds/r$r/round.json" ] || continue
+    t="$(jq -r .type "$d/rounds/r$r/round.json")"
+    pr="$(jq -r --arg p "$p" 'if has("present") then (if (.present | index($p)) != null then "you were asked" else "you were NOT asked" end) else "presence not recorded" end' "$d/rounds/r$r/round.json")"
+    if [ "$pr" = "you were NOT asked" ] && [ -s "$d/rounds/r$r/meta/$p.json" ]; then
+      if jq -e '(.delivered == true) and ((.state | IN("skipped","failed")) | not)' "$d/rounds/r$r/meta/$p.json" >/dev/null 2>&1; then pr="you were asked (brief delivered after the roster snapshot)"   # codex C6 (iteration 10)
+      else pr="$pr ($(jq -r '.reason // .state' "$d/rounds/r$r/meta/$p.json"))"; fi
+    fi
+    out+="- round $r ($t): $pr"$'\n'
+    [ -s "$d/rounds/r$r/matrix.md" ] && out+="  - matrix (every vote with its complete reason): $d/rounds/r$r/matrix.md"$'\n'
+    b="$(ls "$d/rounds/r$r/dispatch/"*.md 2>/dev/null | head -1 || true)"; [ -z "$b" ] || out+="  - the brief the panels answered (positions, votes, rules): $b"$'\n'
+    [ -s "$d/rounds/r$r/corrections.md" ] && out+="  - corrections filed: $d/rounds/r$r/corrections.md"$'\n'
+    [ -s "$d/rounds/r$r/in/$p.md" ] && out+="  - your own answer: $d/rounds/r$r/in/$p.md"$'\n'
+  done
+  out+="- abstain remains a valid, final answer; a no needs quoted objections; yes signs the draft as written."$'\n'
+  printf '%s' "$out"
+}
+context_for() { # context_for <mode> <panel>
+  case "$1" in
+    all) printf '%s' "${all_answers:-(none)}";;
+    conflicts) printf 'Every position and every recorded vote — with its complete reason — is rendered in this brief under the conflicts. Your own earlier answers:\n%s' "$(own_answers "$2")";;
+    *) printf '%s%s%s' "${r1_answers:-(none)}" "${prev_matrix:+- previous round matrix (every vote with its complete verbatim reason): $prev_matrix
+}" "${dis:+- current conflict list: $dis
+}";;
+  esac
+}
+ids_json='null'; [ -n "$ids" ] && ids_json="$(printf '%s' "$ids" | jq -R 'split(",") | map(gsub("\\s";""))')"
+# Q3(a)/(b) (iteration 8, 4/4): who is present this round is known before the brief is written — from roster.json (status, budget gate) and --only.
+only_json='null'; [ -z "$only" ] || only_json="$(printf '%s' "$only" | jq -R 'split(",")')"
+present_json="$(jq -c --argjson only "$only_json" '[.panels[] | select(.dispatchable == true and .budget != "skip") | select($only == null or (.panel | IN($only[]))) | .panel]' "$rd/roster.json")"
+skipped_md="$(jq -r --argjson only "$only_json" --arg sd "$PANEL_STATE_DIR/budget" '.panels[] | select((.dispatchable != true) or (.budget == "skip") or ($only != null and ((.panel | IN($only[])) | not)))
+  | "\(.panel) — " + (if ($only != null and ((.panel | IN($only[])) | not)) then "not in --only" elif .budget == "skip" then "budget: \(.budget_reason)" else "agent status: \(.status)" end) + (if .budget == "skip" then " [reading: \($sd)/\(.label).json]" else "" end)' "$rd/roster.json" | while IFS= read -r l; do
+    case "$l" in *"[reading: "*) f="${l##*\[reading: }"; f="${f%\]}"; [ -s "$f" ] && l="${l%% \[reading:*} [reading seen $(jq -r '.seen_at' "$f"), source $(jq -r '.source' "$f"), dated=$(jq -r 'if has("dated") then .dated else "absent" end' "$f"), uncertain=$(jq -r 'if has("uncertain") then .uncertain else "absent (pre-1.8.0 state)" end' "$f"), positional=$(jq -r 'if has("positional") then .positional else "absent (pre-1.9.0 state)" end' "$f")]";; esac
+    printf '%s\n' "$l"; done)"
+conflicts_md=""; votes_md=""
+if [ -n "$dis" ]; then
+  conflicts_md="$(jq -r --argjson ids "$ids_json" --argjson present "$present_json" '.conflicts[] | select($ids == null or (.id | IN($ids[]))) | "### \(.id) — \(.topic)\n" + ((.positions | to_entries | map("- **\(.key)**: \(.value.summary)  _(held by: \((.value.held_by // []) | join(", ")))_" + (if ((.value.held_by // []) | length) > 0 and (([(.value.held_by // [])[] | select(. as $h | $present | index($h))] | length) == 0) then "  **UNHELD this round** — none of its holders is present; it stays on the ballot at zero weight (Q3(a), iteration 8): a resolution against it is unopposed among the panels present, not a vote of its holders" else "" end) + (if ((.value.aliases // [])|length) > 0 then "  _(same as: \(.value.aliases | join(", ")) — declared by every holder)_" else "" end) + (if ((.value.refs // [])|length) > 0 then "  _(refs: \(.value.refs | join(", ")))_" else "" end))) | join("\n")) + (if (.note // "") != "" then "\n- note: \(.note)" else "" end) + "\n"' "$dis")"
+  # U52 (iteration 4): PROMOTE lines that did not parse last round kept it open (D16) — show them so the panel restates or drops them knowingly
+  up="$(jq -r '(.unparseable_promotions // [])[] | "- \(.panel): \(.line)"' "$dis" 2>/dev/null || true)"
+  [ -z "$up" ] || conflicts_md+=$'\n\n### PROMOTE lines from the last round that did not parse (D16: they kept the round open — restate in the format, or drop them)\n'"$up"
+  if [ "$framing" = true ]; then
+    conflicts_md="### D0 — framing (D5-A; extended to the charter by D4-A, iteration 5): are the charter's framing (its questions, reading set, non-goals, and any reading cap applied to you) AND the conflict list below complete and fairly framed?
+- **A**: the charter's framing and the conflict list are complete and fairly framed
+- **B**: one of them is not — say in your one sentence what is missing or misframed (charter section, or panel/file/claim). A B about the conflict list keeps the round open until the list is fixed; a B about the charter stops the round for the human to re-charter (the orchestrator may not rewrite the charter alone). To get a missing item voted on, add a PROMOTE line under NEW CONFLICTS (format below); it mints a D-id mechanically.
+
+$conflicts_md"
+  fi
+  # U20: for context=conflicts panels the last recorded votes travel in the brief, complete
+  if lvf="$(last_votes)"; then
+    votes_md="$(jq -r --argjson ids "$ids_json" '.conflicts[] | select(.id != "D0") | select($ids == null or (.id | IN($ids[]))) | "#### last votes on \(.id) (complete reasons)\n\n| panel | vote | why |\n|---|---|---|\n" + (.votes | map("| \(.panel) | \(.choice)\(if (.eq|length)>0 then " (=\(.eq|join(",")))" else "" end) | \(.why|gsub("\n";" ")|gsub("\\|";"\\\\|")) |") | join("\n")) + "\n"' "$lvf")"
+  fi
+  # U5 audit trail: what was put to the vote, with holders
+  jq -r --argjson ids "$ids_json" '.conflicts[] | select($ids == null or (.id | IN($ids[]))) | "\(.id) \(.topic) — " + (.positions | to_entries | map("\(.key)[\((.value.held_by // [])|join(","))]") | join(" "))' "$dis" | while IFS= read -r l; do transcript "$d" "r$round" "conflict put to vote: $l"; done
+  [ "$framing" = true ] && transcript "$d" "r$round" "conflict put to vote: D0 framing (auto-injected, D5-A)"
+fi
+vote_tables=""
+if [ -n "$draft" ]; then vote_tables="$(awk '/^## Resolved conflicts/{p=1} /^## Position changes/{p=0} p' "$draft")"; fi
+changelog="(first ratification — no changes)"
+if [ -n "$draft" ] && [ "$topup" = 0 ] && last_snapshot >/dev/null 2>&1 && [ -s "$d/consensus-draft.changelog.md" ]; then changelog="$(cat "$d/consensus-draft.changelog.md")"; fi
+[ "$topup" = 1 ] && changelog="(top-up: the text is byte-identical to the one already ratified by the other members; you are asked only whether you sign it)"
+schema="$(cat "$PANEL_TEMPLATES/answer-schema.md")"
+ts="$(now_iso)"; ts_epoch="$(now_epoch)"
+# U42 (iteration 3): pin the skill tree the panels are reviewing/being driven by — line cites in answers are only meaningful against a revision
+# U42 (iteration 6, orchestrator-observed): the repo HEAD moves on unrelated wiki commits and raised CHANGED MID-SESSION falsely —
+# pin the last commit that touched the skill tree itself
+skill_rev="$(git -C "$PANEL_SKILL_DIR" log -1 --format=%h -- . 2>/dev/null || true)"; [ -n "$skill_rev" ] || skill_rev=unknown
+[ -z "$(git -C "$PANEL_SKILL_DIR" status --porcelain -- . 2>/dev/null)" ] || skill_rev="$skill_rev-dirty"
+skill_version="$(grep -m1 -E '^[[:space:]]*version:' "$PANEL_SKILL_DIR/SKILL.md" | sed -E 's/.*version:[[:space:]]*"?([^"]+)"?.*/\1/')"
+case "$type" in
+  blind) goal="answer the charter questions independently (you see no other panel)"; read_hint="the charter below, reading set items in order (your cap is applied)";;
+  cross) goal="vote on every conflict below (D0 included) with a letter, abstain, or a new letter"; read_hint="the conflicts below, then EVERY file listed under Earlier answers";;
+  focus) goal="re-vote on the listed open conflicts only"; read_hint="the conflicts and the previous matrix listed below";;
+  ratify) goal="confirm the consensus draft says what you agreed — yes, no (with quoted objections) or abstain (you do not sign)"; read_hint="the draft (path below) and the vote tables embedded in this brief";;
+esac
+# iteration 5 D3-A: a narrowed round says so in every brief it sends (the AUDIT line alone was visible only after the round)
+[ -z "$only" ] || goal="$goal · THIS ROUND WENT ONLY TO: $only${reason:+ — reason given by the orchestrator: $reason} (AUDIT line in transcript.md)"
+# Q3(b) / U75 (iteration 8, 4/4): a budget or status skip narrows the roster exactly as --only does, so every brief names it, with the reading it acted on
+[ -z "$skipped_md" ] || goal="$goal · NOT ASKED THIS ROUND (roster narrowed by the gate, U75): $(printf '%s' "$skipped_md" | tr '\n' ';' | sed 's/;$//; s/;/; /g')"
+
+# charter per panel: trim the ordered reading set to reading_cap (manifest) if set
+charter_for() { local cap="$1"; if [ -z "$cap" ]; then cat "$d/charter.md"; else awk -v cap="$cap" '/^## /{rs=($0 ~ /^## Reading set/)} rs && /^[0-9]+\./{n=$0; sub(/\..*/,"",n); if (n+0>cap){dropped++; next}} {print} END{if(dropped>0) print "\n(" dropped " reading-set item(s) beyond your reading_cap=" cap " were omitted from your copy of the charter.)"}' "$d/charter.md"; fi; }
+
+# U28: snapshot the draft the panels will read
+snap=""; dsha=""; gsnap=""; gsha=""
+if [ -n "$draft" ]; then
+  snap="$rd/consensus-draft.dispatched.md"; cp "$draft" "$snap"; dsha="$(sha256sum "$snap" | cut -c1-64)"
+  # D4-C (iteration 8, 4/4): the generated snapshot this draft was built from is recorded here, at dispatch, with its sha — --changelog reads the
+  # record, not mtimes (which a copy, restore or git checkout reorders). At this moment the newest generated snapshot is unambiguous.
+  for ((r = prev; r >= 1; r--)); do [ -s "$d/rounds/r$r/consensus-draft.generated.md" ] && { gsnap="$d/rounds/r$r/consensus-draft.generated.md"; break; }; done
+  [ -z "$gsnap" ] || gsha="$(sha256sum "$gsnap" | cut -c1-64)"
+  [ "$topup" = 1 ] && json_set "$d/session.json" '.partial_retries = ((.partial_retries // 0) + 1)'
+fi
+jq -n --argjson round "$round" --arg type "$type" --arg t "$ts" --argjson prev "$prev" --arg dis "${dis}" --arg draft "${draft}" --arg snap "$snap" --arg sha "$dsha" --arg tpl "round-$type.md" --argjson ids "$ids_json" --arg only "$only" --arg ctx "$ctx" --arg reason "$reason" --argjson framing "$framing" --argjson topup "$topup" \
+  --arg skill_rev "$skill_rev" --arg skill_version "$skill_version" --arg gsnap "$gsnap" --arg gsha "$gsha" --argjson present "$present_json" \
+  '{round:$round, type:$type, dispatched_at:$t, prev_round:$prev, template:$tpl, context:$ctx, reason:(if $reason=="" then null else $reason end), framing:$framing, topup:($topup==1), skill_rev:$skill_rev, skill_version:$skill_version,
+    disagreements:(if $dis=="" then null else $dis end), draft:(if $draft=="" then null else $draft end), draft_snapshot:(if $snap=="" then null else $snap end), draft_sha:(if $sha=="" then null else $sha end),
+    generated_snapshot:(if $gsnap=="" then null else $gsnap end), generated_sha:(if $gsha=="" then null else $gsha end), present:$present, ids:$ids, only:(if $only=="" then null else ($only|split(",")) end)}' > "$rd/round.json"
+transcript "$d" "r$round" "dispatch type=$type context=$ctx skill=$skill_version@$skill_rev${only:+ only=$only}${ids:+ ids=$ids}${dsha:+ draft_sha=${dsha:0:12}}$([ "$dry" = 1 ] && printf " DRY-RUN")"
+
+sent=0; skipped=0; queued=0
+while IFS=$'\t' read -r panel label pane kind status dispatchable tmo budget breason dclean dcreason; do
+  ans="$rd/in/$panel.md"; dfile="$rd/dispatch/$panel.md"; meta="$rd/meta/$panel.json"
+  reason_p=""; state="dispatched"; delivered=true
+  if [ -n "$only" ] && ! printf ',%s,' "$only" | grep -q ",$panel,"; then state=skipped; delivered=false; reason_p="not in --only"; fi
+  case "$breason" in *"NOT skipped"*) reason_p="budget: $breason";; esac   # D6-B (iteration 8): a caveated over-pace reading dispatches, and says so in the record
+  if [ "$state" = dispatched ] && [ "$dispatchable" != true ]; then
+    if [ "$budget" = skip ]; then state=skipped; delivered=false; reason_p="budget: $breason"
+    elif [ "$queue" = 1 ] && [ "$status" = working ] && [ "$kind" != "-" ]; then state=queued; delivered=false; reason_p="agent working — brief queued, delivered by panel-collect when it settles"
+    else state=skipped; delivered=false; reason_p="agent status: $status"; fi
+  fi
+  pmode="$(manifest_get "$label" '.context' '')"; [ -n "$pmode" ] || pmode="$ctx"
+  cap="$(manifest_get "$label" '.reading_cap' '')"
+  prev_list="$(context_for "$pmode" "$panel")"
+  conf_p="$conflicts_md"; [ "$pmode" = conflicts ] && [ -n "$votes_md" ] && conf_p="$conflicts_md
+$votes_md"
+  if [ "$type" = ratify ]; then   # U9/U23: the evidence list at ratification follows the panel's context mode, not its provider
+    case "$pmode" in
+      conflicts) prev_list="$(own_answers "$panel")- other panels' files: see the pointers in the vote tables below"$'\n';;
+      r1+matrix) prev_list="${r1_answers}${prev_matrix:+- last matrix (every vote, complete reasons): $prev_matrix
+}$(own_answers "$panel")";;
+    esac
+    [ "$topup" != 1 ] || prev_list+="$(topup_record "$panel")"   # Q3(a): the top-up brief carries the discussion the member missed
+  fi
+  deadline="answer within ~$(( ${tmo:-$PANEL_PANEL_TIMEOUT_S} / 60 )) minutes (this panel's timeout_s=${tmo:-$PANEL_PANEL_TIMEOUT_S}); a crisp answer beats an exhaustive one"
+  if [ "$state" = dispatched ] || [ "$state" = queued ]; then
+    render_template "$PANEL_TEMPLATES/round-$type.md" SESSION_ID="$sid" ROUND="$round" PANEL="$panel" ANSWER_FILE="$ans" ANSWER_SCHEMA="$schema" SKILL_REV="$skill_version@$skill_rev" \
+      CHARTER="$(charter_for "$cap")" PREV_ANSWERS="$prev_list" CONFLICTS="$conf_p" DRAFT="${snap:-$draft}" IDS="${ids:-}" CHANGELOG="$changelog" \
+      VOTE_TABLES="$vote_tables" GOAL="$goal" READ="$read_hint" DEADLINE="$deadline" > "$dfile"
+  fi
+  pointer="PANEL TASK $sid r$round/$type. You are panel \"$panel\". Read the file $dfile and follow it exactly. Write your answer ONLY to $ans and create or modify no other file (optional sections may be skipped; abstain is a valid final vote). When done, reply with only that path."
+  if [ "$state" = dispatched ] && [ "$dry" = 0 ]; then
+    # I4 modal guard (v1.12.2): the roster gate ran before the reset fan-out; between then and now the
+    # pane may have opened a picker/dialog. The screen is checked at SEND time — r1 text typed into a
+    # modal lands in its input box (two r1 pointers landed in model-picker search boxes, 2026-09-08).
+    dmodal="$(printf '%s' "$(pane_screen "$pane")" | screen_modal_class)"
+    if [ -n "$dmodal" ]; then
+      state=skipped; delivered=false; reason_p="pane is in a $dmodal state — brief withheld (I4, fail closed)"
+    elif err="$(herdr agent prompt "$pane" "$pointer" 2>&1 >/dev/null)"; then sent=$((sent + 1)); reset_mark_used "$label" "$sid" "PANEL TASK $sid"
+    else state=failed; delivered=false; reason_p="$(printf '%s' "$err" | jq -r '.error.code // empty' 2>/dev/null || true)"; [ -n "$reason_p" ] || reason_p="$err"; fi
+  elif [ "$state" = dispatched ] && [ "$dry" = 1 ]; then printf 'DRY  %-30s %-7s -> %s\n' "$panel" "$pane" "${pointer:0:100}…"; fi
+  [ "$state" = queued ] && queued=$((queued + 1))
+  [ "$state" = dispatched ] || [ "$state" = queued ] || skipped=$((skipped + 1))
+  [ "$dry" = 1 ] && [ "$state" = dispatched ] && state=DRY
+  dbytes=0; [ -f "$dfile" ] && dbytes="$(wc -c < "$dfile")"
+  bepoch="$ts_epoch"; [ -f "$dfile" ] && bepoch="$(file_mtime "$dfile")"   # iteration 9 (orchestrator, spark r3): the brief's own time is the freshness key for its answer
+  jq -n --arg panel "$panel" --arg pane "$pane" --arg kind "$kind" --arg state "$state" --arg reason "$reason_p" --argjson delivered "$delivered" --arg ctxm "$pmode" \
+    --arg t "$ts" --argjson te "$ts_epoch" --arg ans "$ans" --arg dfile "$dfile" --arg ptr "$pointer" --argjson tmo "${tmo:-$PANEL_PANEL_TIMEOUT_S}" --argjson db "$dbytes" --argjson be "$bepoch" \
+    --arg clean "$dclean" --arg creason "$dcreason" \
+    '{panel:$panel, pane_id:$pane, kind:$kind, state:$state, reason:$reason, reason_class:null, delivered:$delivered, context:$ctxm, dispatched_at:$t, dispatched_at_epoch:$te, brief_epoch:$be,
+      timeout_s:$tmo, nudges:0, seen_working:false, answer_file:$ans, dispatch_file:$dfile, dispatch_bytes:$db, pointer:$ptr, updated:$t, clean:$clean, clean_reason:$creason}' > "$meta"
+  transcript "$d" "r$round" "$panel ($pane, $kind) → $state${reason_p:+ ($reason_p)}"
+  printf '%-10s %-30s %-7s %s\n' "$state" "$panel" "$pane" "${reason_p:-}"
+done < <(jq -r '.panels[] | [.panel, .label, .pane_id, (.kind // "-"), .status, (.dispatchable|tostring), (.timeout_s|tostring), .budget, .budget_reason, (.clean // "?"), (.clean_reason // "")] | @tsv' "$rd/roster.json")
+
+if [ "$dry" = 1 ]; then rm -rf "$rd"; [ "$topup" = 1 ] && json_set "$d/session.json" '.partial_retries = ((.partial_retries // 1) - 1)'; printf 'dry-run: nothing sent, %s removed\n' "$rd"; exit 0; fi
+if [ "$sent" -eq 0 ] && [ "$queued" -eq 0 ]; then
+  rm -rf "$rd"; transcript "$d" "r$round" "rolled back: nothing was sent"
+  [ "$topup" = 1 ] && json_set "$d/session.json" '.partial_retries = ((.partial_retries // 1) - 1)'
+  die "round $round ($type): nothing was sent ($skipped skipped) — round dir removed; fix the roster or --only and retry"
+fi
+session_state "$d" "r$round-$type-dispatched"
+# v1.12.3 (Phase 4): the exit status says what actually happened, without hiding failures to fake rc=0 —
+# rc 0 = every dispatched/queued participant delivered; rc 5 = PARTIAL (some delivered, some skipped/
+# failed — the round stands, the record says who was missed); the nothing-sent branch above keeps its
+# rc 1 (fatal, round rolled back). A partial round keeps its meaningful non-zero status per Phase 4.
+if [ "$skipped" -gt 0 ] && [ "$((sent + queued))" -gt 0 ]; then
+  transcript "$d" "r$round" "PARTIAL dispatch: $skipped skipped/failed — $sent sent, $queued queued (exit 5)"
+fi
+printf '\nround %s (%s): %s sent, %s queued, %s skipped. %s\nNEXT: %s/panel-collect %s\n' "$round" "$type" "$sent" "$queued" "$skipped" \
+  "$([ "$skipped" -gt 0 ] && [ $((sent + queued)) -gt 0 ] && printf 'PARTIAL — not every participant was reached (see transcript/).' || printf '')" "$B" "$d"
+[ "$skipped" -eq 0 ] || [ $((sent + queued)) -eq 0 ] || exit 5

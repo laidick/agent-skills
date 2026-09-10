@@ -1,0 +1,122 @@
+#!/usr/bin/env bash
+# panel-publish — publish a FINISHED panel session's record to the GitHub report repo (v1.13.0).
+# Runs automatically at the end of panel-report (owner rule 2026-09-09: a finished panel discussion
+# ALWAYS produces a summary + detailed report in GitHub, the console prints the full report URL and
+# a quick human summary). Also re-runnable standalone: idempotent — a session's directory in the
+# repo is updated in place, a new commit appears only when content actually changed, the README
+# index row is never duplicated. The push is verified (local HEAD == remote HEAD) before the URL
+# is printed. No herdr needed (git + gh only).
+#
+# Terminal states publish: CONSENSUS / CONSENSUS-PARTIAL / SPLIT-WITH-RECORD (ratified) and SPLIT
+# (cap reached, no ratification) — the session record as it stands, verbatim: REPORT.md,
+# consensus.md, summary.md (when present) and every round's matrix.md / votes.json / ratify.json.
+# INCOMPLETE sessions defer with the reason (publish again once the session concludes).
+#
+# Usage: panel-publish <session>
+# Env:   PANEL_REPORT_REPO       override the repo (default: manifest .github.report_repo, else
+#                                $PANEL_REPORT_REPO or manifest .github.report_repo — REQUIRED
+#                                when publishing; there is no default account)
+#        PANEL_REPORT_REMOTE_URL override the git remote (tests point this at a local bare repo)
+#        PANEL_REPORTS_CLONE     working clone dir (default ~/dev/panel-reports)
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+command -v git >/dev/null 2>&1 || die "git is required for publishing"
+command -v gh  >/dev/null 2>&1 || die "gh CLI is required for publishing (gh auth)"
+[ $# -ge 1 ] || die "usage: panel-publish <session>"
+d="$(resolve_session "$1")"
+
+# --- terminal-state gate (mirrors panel-report's outcome computation — keep in sync) ------------
+sid="$(jq -r .session_id "$d/session.json")"; state="$(jq -r .state "$d/session.json")"
+max="$(jq -r .max_rounds "$d/session.json")"
+disc=0; for rj in "$d"/rounds/r*/round.json; do case "$(jq -r .type "$rj" 2>/dev/null)" in blind|cross) disc=$((disc+1));; esac; done
+outcome="INCOMPLETE"
+if [ "$state" = ratified ] && [ -s "$d/consensus.md" ]; then outcome="$(jq -r '.outcome // "CONSENSUS"' "$d/session.json")"
+elif [ "$disc" -ge "$max" ] && [ "$state" != ratified ]; then outcome="SPLIT"; fi
+if [ "$outcome" = INCOMPLETE ]; then
+  printf 'publish: deferred — session %s is not terminal yet (state=%s, %s/%s discussion rounds); it publishes when it concludes\n' "$sid" "$state" "$disc" "$max"
+  exit 0
+fi
+
+# --- repo / clone ------------------------------------------------------------------------------
+repo="${PANEL_REPORT_REPO:-$(jq -r '.github.report_repo // empty' "$PANEL_MANIFEST" 2>/dev/null || true)}"
+[ -n "$repo" ] || die "no report repo configured — set PANEL_REPORT_REPO (or .github.report_repo in the manifest) to <owner>/<repo>; panel-publish creates it private on first use"
+remote="${PANEL_REPORT_REMOTE_URL:-$(printf 'git@github.com:%s.git' "$repo")}"
+clone="${PANEL_REPORTS_CLONE:-$HOME/dev/panel-reports}"
+if ! gh repo view "$repo" --json name,isPrivate >/dev/null 2>&1; then
+  gh repo create "$repo" --private --description "Panel review session reports — auto-published by the panel skill" \
+    || die "could not create $repo (gh auth ok? create it by hand, then re-run panel-publish)"
+fi
+if [ ! -d "$clone/.git" ]; then
+  git clone "$remote" "$clone" 2>/dev/null || die "could not clone $remote into $clone"
+fi
+if git -C "$clone" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then
+  git -C "$clone" fetch origin >/dev/null 2>&1
+  git -C "$clone" pull --ff-only >/dev/null 2>&1 || die "$clone diverged from the remote — resolve it by hand, then re-run panel-publish"
+fi
+
+# --- content: the session record, verbatim ------------------------------------------------------
+dest="$clone/reports/$sid"; mkdir -p "$dest"
+for f in REPORT.md consensus.md summary.md; do [ -s "$d/$f" ] && cp "$d/$f" "$dest/$f"; done
+for rdir in "$d"/rounds/r*/; do
+  r="$(basename "$rdir")"; mkdir -p "$dest/$r"
+  for f in matrix.md votes.json ratify.json; do [ -s "$rdir/$f" ] && cp "$rdir/$f" "$dest/$r/$f"; done
+done
+nfiles="$(find "$dest" -type f | wc -l)"
+
+# --- README index (one row per session; updated in place, never duplicated) ---------------------
+# first real sentence of the session's own verdict text: summary.md (skip any leading prose wrapper),
+# else the first line of consensus.md. `|| true` on every stage — an empty one-line is fine.
+one_line="$(sed '1,3d' "$d/summary.md" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' | head -1 | cut -c1-140 || true)"
+[ -n "$one_line" ] || one_line="$(grep -vE '^[[:space:]]*(#|$)' "$d/consensus.md" 2>/dev/null | head -1 | cut -c1-140 || true)"
+[ -n "$one_line" ] || one_line="$(printf '%s — %s' "$state" "$(jq -r '.outcome // ""' "$d/session.json")")"
+# strip a leading "Outcome: **…**" label — the index row already carries the outcome column; if the
+# label WAS the whole line, fall to the next content line of consensus.md (never an empty verdict)
+one_line="$(printf '%s' "$one_line" | sed -E 's/^[[:space:]]*Outcome:[[:space:]]*\*\*[^*]*\*\*[[:space:]:—-]*//; s/^[[:space:]]+//; s/[[:space:]]+$//')"
+if [ -z "$one_line" ] && [ ! -s "$d/summary.md" ]; then
+  one_line="$(grep -vE '^[[:space:]]*(#|$)' "$d/consensus.md" 2>/dev/null | sed -n 2p | cut -c1-140 || true)"
+fi
+[ -n "$one_line" ] || one_line="$(printf '%s — %s' "$state" "$(jq -r '.outcome // ""' "$d/session.json")")"
+members="$(jq -r '(.members // []) | join(", ")' "$d/session.json")"
+row="| $(now_iso | cut -c1-10) | [$sid](reports/$sid/REPORT.md) | $outcome | $members | $one_line |"
+readme="$clone/README.md"
+if [ ! -s "$readme" ]; then
+  { printf '# Panel session reports\n\nOne report per finished panel session — REPORT.md + consensus + per-round vote tables, verbatim, auto-published by the panel skill.\n\n'
+    printf '| published | session | outcome | panels | one-line verdict |\n|---|---|---|---|---|\n'; } > "$readme"
+fi
+if grep -qF "reports/$sid/REPORT.md" "$readme"; then
+  awk -v link="reports/$sid/REPORT.md" -v row="$row" 'index($0, link) { print row; next } { print }' "$readme" > "$readme.new" && mv "$readme.new" "$readme"
+else
+  printf '%s\n' "$row" >> "$readme"
+fi
+
+# --- commit / push / verify --------------------------------------------------------------------
+# refresh the index first: files committed and re-checked within the same second can otherwise read
+# as phantom-modified (git's racy-clean stat), minting a spurious "idempotent" commit
+git -C "$clone" update-index -q --refresh >/dev/null 2>&1 || true
+changed=0
+if ! git -C "$clone" diff --quiet -- "$dest" "$readme" 2>/dev/null || [ -n "$(git -C "$clone" status --porcelain -- "$dest" "$readme" 2>/dev/null)" ]; then changed=1; fi
+if [ "$changed" = 1 ]; then
+  git -C "$clone" add -- "$dest" "$readme"
+  git -C "$clone" -c user.name="panel-publish" -c user.email="panel@$(hostname)" commit -q -m "report: $sid ($outcome)" \
+    || die "commit failed in $clone"
+  if git -C "$clone" rev-parse -q --verify '@{u}' >/dev/null 2>&1; then git -C "$clone" push -q origin HEAD
+  else git -C "$clone" push -q -u origin HEAD; fi
+fi
+git -C "$clone" fetch -q origin 2>/dev/null || true
+br="$(git -C "$clone" symbolic-ref --short HEAD)"
+head_rev="$(git -C "$clone" rev-parse HEAD)"
+remote_rev="$(git -C "$clone" rev-parse -q --verify "origin/$br" || echo mismatch)"
+[ "$head_rev" = "$remote_rev" ] || die "push not verified: local HEAD $head_rev != origin/$br $remote_rev"
+
+url="https://github.com/${repo%.git}/blob/$br/reports/$sid/REPORT.md"
+json_set "$d/session.json" '.published = {repo:$r, url:$u, at:$t, rev:$v}' \
+  --arg r "$repo" --arg u "$url" --arg t "$(now_iso)" --arg v "$head_rev"
+transcript "$d" publish "session record published to $repo (rev ${head_rev:0:12}, $nfiles files)"
+
+# --- console: full URL + quick human summary ----------------------------------------------------
+unsigned="$(jq -r '(.unsigned // []) | join(", ")' "$d/session.json")"
+printf 'published: %s\n' "$url"
+printf 'verified:  remote %s HEAD == local (%s) · %s files · rev %s\n' "${repo%.git}" "${br}" "$nfiles" "${head_rev:0:7}"
+printf 'outcome:   %s\n' "$(jq -r '.outcome // ""' "$d/session.json" | grep -q . && jq -r '.outcome' "$d/session.json" || echo "$outcome")"
+[ -z "$unsigned" ] || printf 'unsigned:  %s — the human decides (D2-B top-up possible)\n' "$unsigned"
+printf 'verdict:   %s\n' "$one_line"

@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# panel-note — append one audit line to the session transcript for an editorial act by the orchestrator (U5):
+# which conflicts you created/merged/dropped, how you triaged an objection, why a late answer was or was not merged — and from which files.
+# Usage: panel-note <session> "<text>"
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+[ $# -ge 2 ] || die "usage: panel-note <session> \"<text>\""
+d="$(resolve_session "$1")"; shift
+transcript "$d" AUDIT "$*"
+tail -1 "$d/transcript.md"

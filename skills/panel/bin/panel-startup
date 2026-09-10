@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# panel-startup — print (or run) the full-parameter CLI start command for every manifest panel
+# (v1.13.0, owner rule 2026-09-09: every agent startup MUST pass model / provider / context /
+# permission mode explicitly — never rely on settings defaults, which /new and session resets
+# silently fall back to).
+#
+# The command comes from the manifest entry's `start[]` — captured per panel, hand-tuned, and
+# REGRESSION-TESTED (tests/test-startup.sh re-runs each command in -p/--print mode and checks the
+# reply). Use it to:
+#   start one panel by hand            panel-startup <label> [--run]
+#   print every panel's command        panel-startup --all
+#   verify all commands still answer   panel-startup --all --test
+#
+# What each CLI carries natively (verified against each --help, 2026-09-09):
+#   pi        --provider P --model M [--thinking T]      (sticky across /new: createRuntime closure)
+#   claude    --model M --permission-mode MODE            (opus[1m] alias; bypassPermissions)
+#   codex     --yolo -m M -c model_reasoning_effort=E    (yolo = approvals+sandbox bypass)
+#   agy       --model M --effort E --dangerously-skip-permissions
+#   opencode  -m provider/model --auto                   (zen models: opencode-go/<id>)
+# No herdr needed for printing; --run/--test execute locally in $PANEL_STARTUP_CWD (default: the manifest's directory).
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+
+label=""; do_all=0; do_run=0; do_test=0
+while [ $# -gt 0 ]; do case "$1" in
+  --all)    do_all=1; shift;;
+  --run)    do_run=1; shift;;
+  --test)   do_test=1; shift;;
+  -h|--help) sed -n '2,22p' "$0"; exit 0;;
+  -*) die "unknown arg: $1";;
+  *) [ -z "$label" ] || die "one label only (or --all)"; label="$1"; shift;;
+esac; done
+[ "$do_all" = 1 ] && [ -n "$label" ] && die "label and --all are mutually exclusive"
+[ "$do_all" = 0 ] && [ -z "$label" ] && die "usage: panel-startup <label> | --all [--run|--test]"
+[ -f "$PANEL_MANIFEST" ] || die "no manifest at $PANEL_MANIFEST"
+
+cwd="${PANEL_STARTUP_CWD:-$(dirname "$PANEL_MANIFEST")}"
+
+# print mode label -> quoted command (one line)
+print_cmd() { # print_cmd <label>
+  jq -r --arg l "$1" '.panels[$l].start | map(if test("[][ (){}*?|\\\"]") then "\"\"\"\"\""+.+\"\"\"\"\"\" else . end) | join(" ")' "$PANEL_MANIFEST" 2>/dev/null \
+    || jq -r --arg l "$1" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST"
+}
+
+# a per-kind headless test prompt: -p/--print/exec/run reply with a marker we can check
+test_one() { # test_one <label> -> 0 ok
+  local l="$1" kind cmd marker out
+  kind="$(jq -r --arg l "$l" '.panels[$l].kind' "$PANEL_MANIFEST")"
+  marker="STARTUP-$RANDOM-OK"
+  case "$kind" in
+    pi)        cmd="$(jq -r --arg l "$l" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST") -p";;
+    claude)    cmd="$(jq -r --arg l "$l" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST") -p";;
+    codex)     cmd="$(jq -r --arg l "$l" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST") exec";;
+    agy)       cmd="$(jq -r --arg l "$l" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST") --print";;
+    opencode)  cmd="opencode run $(jq -r --arg l "$l" '.panels[$l].start[1:] | join(" ")' "$PANEL_MANIFEST")";;   # `run` first, then the manifest's flags
+    *) die "no headless test mode for kind '$kind'";;
+  esac
+  out="$(cd "$cwd" && timeout "${PANEL_STARTUP_TEST_TIMEOUT_S:-60}" $cmd "Reply with only: $marker" < /dev/null 2>&1 || true)"
+  if printf '%s' "$out" | grep -q "$marker"; then
+    printf 'ok       %-30s %s\n' "$l" "$(printf '%s' "$out" | grep -m1 -o "$marker")"
+    return 0
+  fi
+  printf 'FAIL     %-30s %s\n' "$l" "$(printf '%s' "$out" | tail -1 | cut -c1-120)"
+  return 1
+}
+
+if [ "$do_all" = 1 ]; then
+  labels="$(jq -r '.panels | keys[]' "$PANEL_MANIFEST")"
+  if [ "$do_test" = 1 ]; then
+    failed=0
+    while IFS= read -r l; do test_one "$l" || failed=$((failed + 1)); done <<<"$labels"
+    [ "$failed" = 0 ] || die "$failed startup command(s) failed"
+    printf 'all startup commands verified against live CLIs\n'
+    exit 0
+  fi
+  while IFS= read -r l; do printf '%-32s %s\n' "$l" "$(jq -r --arg x "$l" '.panels[$x].start | join(" ")' "$PANEL_MANIFEST")"; done <<<"$labels"
+  exit 0
+fi
+
+jq -e --arg l "$label" '.panels[$l] != null' "$PANEL_MANIFEST" >/dev/null || die "unknown panel: $label"
+cmd="$(jq -r --arg l "$label" '.panels[$l].start | join(" ")' "$PANEL_MANIFEST")"
+if [ "$do_test" = 1 ]; then test_one "$label"; exit $?; fi
+if [ "$do_run" = 1 ]; then (cd "$cwd" && exec $cmd < /dev/tty); fi
+printf '%s\n' "$cmd"

@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# panel-next — print exactly ONE line: the next command (or editorial step) for this session, derived from session.json state.
+# For chat-driven orchestrators and timers (U13/D8-B): re-arm by running what this prints, until it says DONE or HUMAN.
+set -euo pipefail
+. "$(dirname "$0")/panel-lib.sh"
+[ $# -ge 1 ] || die "usage: panel-next <session>"
+d="$(resolve_session "$1")"; B="$(dirname "$0")"; st="$(jq -r .state "$d/session.json")"; r="$(latest_round "$d")"
+case "$st" in
+  intake) charter_unfilled "$d/charter.md" && echo "EDIT $d/charter.md (replace every <<FILL>> in the content; HTML comments are ignored), show it + panel-roster --table to the human, wait for go, then: $B/panel-dispatch $d blind" || echo "GATE: show $d/charter.md + $B/panel-roster --table to the human; on 'go': $B/panel-dispatch $d blind";;
+  r*-dispatched) echo "$B/panel-collect $d $r";;
+  r*-collected) echo "$B/panel-matrix $d $r";;
+  r*-blind-analysed) echo "EDIT $d/rounds/r$r/disagreements.json (≥2 positions each, verbatim summaries + refs with #C<n>/#SECTION anchors, see templates/disagreements.example.json; {\"conflicts\":[]} if none) then: $B/panel-dispatch $d cross   (or, with no conflicts: $B/panel-draft $d --auto && $B/panel-dispatch $d ratify)";;
+  open-conflicts-r*) echo "REVIEW $d/rounds/r$r/disagreements.draft.json (PROMOTE lines already minted; log any pending item you structure with panel-note) → save as $d/rounds/r$r/disagreements.json → $B/panel-dispatch $d cross   (cap reached: $B/panel-dispatch $d focus --only-auto  |  or $B/panel-draft $d --auto && $B/panel-dispatch $d ratify)";;
+  converged-r*) echo "$B/panel-draft $d --auto  (then add quoted uncontested bullets only) && $B/panel-dispatch $d ratify";;
+  ratify-rejected-r*) echo "EDIT $d/consensus-draft.md (only the spans quoted in $d/rounds/r$r/ratify.json objections) → $B/panel-draft $d --changelog (must show 0 ⚠) → $B/panel-dispatch $d ratify";;
+  ratify-void-r*) echo "RESTORE $d/consensus-draft.md from $d/rounds/r$r/consensus-draft.dispatched.md (it was edited after dispatch) or keep the edit → $B/panel-draft $d --changelog → $B/panel-dispatch $d ratify";;
+  votes-changed-r*) echo "$B/panel-draft $d --auto --force (votes moved in r$r changed a result; re-add quoted uncontested bullets) && $B/panel-dispatch $d ratify";;
+  ratify-unclear-r*) u="$(jq -r '.unclear|join(",")' "$d/rounds/r$r/ratify.json")"; echo "$B/panel-nudge $d ${u%%,*} \"Your ratify answer is unclear — rewrite your r$r answer with ## RATIFY yes|no|abstain and VOTES lines as D<n>: <letter> — why\" → $B/panel-collect $d $r --once → $B/panel-matrix $d $r";;
+  ratified)
+    unsigned="$(jq -r '(.unsigned // []) | join(",")' "$d/session.json")"; retries="$(jq -r '.partial_retries // 0' "$d/session.json")"; outcome="$(jq -r '.outcome // "CONSENSUS"' "$d/session.json")"
+    if [ -n "$unsigned" ] && [ "$retries" -eq 0 ]; then echo "$B/panel-dispatch $d ratify --only $unsigned --reason \"D2-B: one re-dispatch to the unsigned members\"   (then panel-collect, panel-matrix; if they still do not sign, the human decides)"
+    elif [ -n "$unsigned" ] && [ ! -s "$d/REPORT.md" ]; then echo "$B/panel-report $d   (then HUMAN DECIDES: $outcome — unsigned after one re-dispatch: $unsigned)"
+    elif [ -s "$d/REPORT.md" ]; then echo "DONE: $d/REPORT.md ($outcome)${unsigned:+ — HUMAN DECIDES about the unsigned: $unsigned}"
+    else echo "$B/panel-report $d"; fi;;
+  *) echo "UNKNOWN state '$st' — inspect $d/transcript.md";;
+esac

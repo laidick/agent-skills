@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# pane-restore — generic engine wrapper: the live-proven panel-restore recipe for ANY pane grid.
+# The panel skill's panel-restore is the reference implementation of this exact procedure
+# (~/dev/agent-skills/skills/panel/bin/panel-restore, verified 3x live 2026-09-09).
+# This wrapper exists so other projects get one entry point: point PANE_RESTORE_SNAPSHOT
+# and PANE_RESTORE_MANIFEST at your own files and delegate, never fork the engine.
+#
+# Snapshot schema (label-keyed): {"tab_w":..,"tab_h":..,
+#   "left":[{"pane_id":..,"h":..,"w":..,"x":..,"y":..}],           # non-grid column panes (orchestrator)
+#   "panels":{"<label>":{"x":..,"y":..,"w":..,"h":..}}}            # grid panes by target slot
+# Manifest schema: {"panels":{"<label>":{"kind":"pi|claude|codex|agy|opencode|hermes",
+#   "start":["<cli>","--model","...","--provider","..."]}}}        # full-parameter start[] (see panel rule 24)
+#
+# Usage: pane-restore <snapshot.json> <manifest.json> [--dry-run] [--force] [-h|--help]
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+engine="$here/../../panel/bin/panel-restore"
+[ -x "$engine" ] || { echo "engine missing: $engine (panel skill must be present)" >&2; exit 1; }
+if [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then sed -n '2,18p' "$0"; exit 0; fi
+snap="${1:?usage: pane-restore <snapshot.json> <manifest.json> [--dry-run] [--force]}"
+man="${2:?usage: pane-restore <snapshot.json> <manifest.json> [--dry-run] [--force]}"
+shift 2
+[ -f "$snap" ] || { echo "no snapshot: $snap" >&2; exit 1; }
+[ -f "$man" ]  || { echo "no manifest: $man" >&2; exit 1; }
+export PANEL_LAYOUT_SNAPSHOT="$snap"
+export PANEL_MANIFEST="$man"
+exec "$engine" "$@"
