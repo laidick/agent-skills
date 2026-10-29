@@ -7,7 +7,7 @@ on: [push, pull_request]
 
 jobs:
   handle-lint:
-    runs-on: [self-hosted, linux, x64, ai-server]
+    runs-on: [self-hosted, linux, x64, fm-linux-ci]
     steps:
       - uses: actions/checkout@v4
       - name: No private handles anywhere in the tree
