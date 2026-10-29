@@ -7,7 +7,7 @@ on: [push, pull_request]
 
 jobs:
   handle-lint:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, x64, ai-server]
     steps:
       - uses: actions/checkout@v4
       - name: No private handles anywhere in the tree
