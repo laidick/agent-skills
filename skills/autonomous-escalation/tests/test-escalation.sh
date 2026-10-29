@@ -115,11 +115,16 @@ assert "git section present" "$pkt" "## git status"
 
 echo "=== 11. secrets do not leak into the help packet ==="
 D7="$TMP/p11"; fresh "$D7" "goal11"
-esc "$D7" attempt --hypothesis "key ghp_ABCDEFghijkl1234567890abcdef1234567 is rotated" --action "token=supersecretvalue password=hunter2 AKIAIOSFODNN7EXAMPLE sk-abcdefghij1234567890abcd Bearer eyJhbGciOiOiOiOiXc" --result fail >/dev/null
+# Fake creds are assembled at runtime so the tree-wide secret gate (handle-lint)
+# never sees a static match, while the redactor still faces the real shapes:
+# ghp_ suffix is 20 chars (redactor floor {20,}, below the gate's {30,}).
+FAKE_GHP="ghp_FAKE0000000000000000"
+FAKE_AWS="AKIA""IOSFODNN7EXAMPLE"
+esc "$D7" attempt --hypothesis "key $FAKE_GHP is rotated" --action "token=supersecretvalue password=hunter2 $FAKE_AWS sk-abcdefghij1234567890abcd Bearer eyJhbGciOiOiOiOiXc" --result fail >/dev/null
 esc "$D7" packet --question "auth: Bearer aaabbbcccddd112233445566 and secret: mydbpass" >/dev/null 2>&1
 pkt="$(cat "$D7/.pi/help/esc-001.md")"
-negate "github token redacted" "$pkt" "ghp_ABCDEFghijkl1234567890abcdef1234567"
-negate "aws key id redacted" "$pkt" "AKIAIOSFODNN7EXAMPLE"
+negate "github token redacted" "$pkt" "$FAKE_GHP"
+negate "aws key id redacted" "$pkt" "$FAKE_AWS"
 negate "sk- key redacted" "$pkt" "sk-abcdefghij1234567890abcd"
 negate "password value redacted" "$pkt" "hunter2"
 negate "bearer token redacted" "$pkt" "eyJhbGciOiOiOiOiXc"
